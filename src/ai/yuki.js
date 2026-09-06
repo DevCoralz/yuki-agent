@@ -120,8 +120,21 @@ async function callModel(messages, modelId) {
   };
   // Optional: only sent if configured, so providers that reject unknown
   // fields (anything not OpenAI-o-series-compatible) aren't broken by it.
+  // Validated against the actual accepted enum first — a bad value here
+  // (e.g. a numeric string like "50" instead of a real effort level) was
+  // previously sent straight through and broke EVERY model call with a
+  // 400 from the server's own OpenAI-compat validation, not a partial
+  // degradation. An invalid value is dropped (with a one-time console
+  // warning) rather than sent and allowed to take the whole bot down.
+  const validEffort = ['none', 'low', 'medium', 'high', 'max'];
   if (environment.yukiReasoningEffort) {
-    body.reasoning_effort = environment.yukiReasoningEffort;
+    if (validEffort.includes(environment.yukiReasoningEffort)) {
+      body.reasoning_effort = environment.yukiReasoningEffort;
+    } else {
+      console.warn(
+        `[Yuki] YUKI_REASONING_EFFORT="${environment.yukiReasoningEffort}" is not one of ${validEffort.join(', ')} — ignoring it for this call instead of sending an invalid value that would fail every request.`,
+      );
+    }
   }
 
   const response = await fetch(endpoint(), {

@@ -31,11 +31,13 @@ RUN if [ -f package-lock.json ]; then npm ci --omit=dev; else npm install --omit
 
 COPY . .
 
-# SESSION_DATA_PATH points here — a Fly Volume mounted at runtime (see
-# fly.toml [[mounts]]) so WhatsApp auth keys and session SQLite databases
-# survive machine restarts/redeploys instead of living in the container's
-# own ephemeral filesystem, which would force a WhatsApp re-pair on every
-# deploy.
-RUN mkdir -p /data/sessions
+# NOTE: intentionally NOT creating /data/sessions here. This runs at
+# IMAGE BUILD time, before Fly ever attaches the [[mounts]] volume — a
+# mkdir here only creates an empty dir inside the image layer, which
+# gets shadowed the instant the real volume mounts at /data on boot. It
+# looked harmless but implied build-time and run-time filesystems are
+# the same, which they aren't; sessionManager.js already does the real
+# mkdir (fs.mkdir(..., { recursive: true })) against the live mounted
+# path at actual startup, which is the only place it can correctly happen.
 
 CMD ["node", "src/app.js"]
