@@ -1,0 +1,17 @@
+# Never send real secrets or local dependencies into the build context.
+.env
+.env.*
+!.env.example
+node_modules/
+
+# Session data belongs on the Fly Volume, mounted at runtime — not baked
+# into the image.
+sessions/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+chat.json
+
+.git/
+.gitignore
+*.log

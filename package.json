@@ -1,0 +1,20 @@
+{
+  "name": "yuki-whatsapp-pairing",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Minimal Telegram-controlled WhatsApp pairing service.",
+  "type": "module",
+  "main": "src/app.js",
+  "scripts": {
+    "start": "node src/app.js",
+    "smoke": "node scripts/smoke-test.js"
+  },
+  "engines": { "node": ">=20.0.0" },
+  "dependencies": {
+    "@hapi/boom": "^10.0.1",
+    "@whiskeysockets/baileys": "^7.0.0-rc11",
+    "dotenv": "^16.4.5",
+    "node-telegram-bot-api": "^0.66.0",
+    "pino": "^9.2.0"
+  }
+}

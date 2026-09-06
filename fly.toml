@@ -1,0 +1,77 @@
+# Fly.io config for the NODE BOT (WhatsApp via Baileys + Telegram) —
+# deployed as its OWN Fly app, separate from the Python model server (see
+# ../DevCoralz_api/fly.toml). This process holds long-lived WhatsApp and
+# Telegram connections — it is NOT an HTTP service.
+#
+# IMPORTANT: deliberately no [http_service] or [[services]] block below.
+# Per Fly's own staff (community.fly.io/t/fly-toml-for-private-background-worker/14977):
+# auto-stop-when-idle only applies to Machines that HAVE a service
+# definition. A worker with no service block simply stays running — this
+# is the correct, confirmed pattern for a no-HTTP background process, not
+# a workaround.
+#
+# One thing that ISN'T set by this file (per that same Fly staff answer,
+# not currently expressible in fly.toml): the restart-on-host-reboot
+# policy. Run this once after your first deploy:
+#   fly machine list                          (get the machine ID)
+#   fly machine update --restart always <machine-id>
+# Without this one manual step, a host-level reboot (rare, but not
+# impossible) could leave the machine stopped rather than restarting.
+#
+# Before first deploy:
+#   fly launch --no-deploy
+#   fly volumes create session_data --size 3 --region <your-region>
+#   cat .env | fly secrets import
+#   fly deploy
+#   fly machine update --restart always <machine-id>   (see note above)
+
+app = "yuki-agent-bot"   # change to whatever you actually name the Fly app
+primary_region = "iad"   # must match the volume's region
+
+[build]
+
+[env]
+  # Non-sensitive config only. YUKI_API_KEY, TELEGRAM_BOT_TOKEN, and any
+  # other real credential go in `fly secrets set`, never here.
+  #
+  # These are genuinely two separate directories in the real code, not a
+  # duplicate: SESSION_DATA_PATH is Baileys' own WhatsApp auth material
+  # (creds.json, pre-keys) per phone number (see sessionManager.js).
+  # YUKI_WORKSPACE_ROOT is the separate root SessionStore uses for the
+  # registry DB, per-chat-session folders, memory DBs, and workspaces (see
+  # sessionStore.js). Both need to persist, so both live under the one
+  # mounted volume below, just in different subdirectories of it.
+  SESSION_DATA_PATH = "/data/whatsapp-auth"
+  YUKI_WORKSPACE_ROOT = "/data/sessions"
+  YUKI_MAX_TOOL_ROUNDS = "12"
+  YUKI_HISTORY_MESSAGES = "12"
+  YUKI_MAX_FILE_BYTES = "512000"
+  # Update this to wherever the model server app actually deploys — Fly
+  # apps can reach each other over the private network at
+  # <app-name>.internal, avoiding public internet round-trips entirely if
+  # both apps are Fly apps in the same org.
+  YUKI_API_BASE_URL = "http://yuki-model-server.internal:8000"
+
+[[mounts]]
+  # A single volume, mounted once at /data — both SESSION_DATA_PATH and
+  # YUKI_WORKSPACE_ROOT above are subdirectories of this same mount, so
+  # one volume covers both without needing two separate mounts. Losing
+  # this on redeploy means every WhatsApp session has to re-pair from a
+  # QR code again, and all remembered facts/chat history are gone — this
+  # MUST be persistent, not the container's own ephemeral filesystem.
+  source = "session_data"
+  destination = "/data"
+
+[processes]
+  app = "node src/app.js"
+
+# No [http_service] / [[services]] block — see the note at the top of
+# this file for why that's intentional, not an oversight.
+
+[[vm]]
+  # This process is lightweight (no model inference happens here — that's
+  # the separate model-server app) — 512MB-1GB is realistic; bump if you
+  # see OOM in `fly logs`.
+  memory = "1gb"
+  cpu_kind = "shared"
+  cpus = 1
