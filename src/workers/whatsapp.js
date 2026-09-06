@@ -132,14 +132,28 @@ async function handleIncomingMessage(msg) {
   if (type === 'group' && !isAddressedInGroup(this, msg, text)) return;
 
   const toolCtx = { sock: this, jid, sourceMsg: msg };
-  const reply = await withTyping(this, jid, () => runYuki(
-    session,
-    cleanText,
-    participantJid,
-    displayName,
-    toolCtx,
-    async (status) => { await this.sendMessage(jid, { text: status }); },
-  ));
+  let reply;
+  try {
+    reply = await withTyping(this, jid, () => runYuki(
+      session,
+      cleanText,
+      participantJid,
+      displayName,
+      toolCtx,
+      async (status) => { await this.sendMessage(jid, { text: status }); },
+    ));
+  } catch (error) {
+    // Without this, a failed model call (bad YUKI_API_BASE_URL, unreachable
+    // model server, bad key, wrong model name) was caught silently further
+    // up in messages.upsert's catch block — logged to `fly logs` only, with
+    // the user never getting any reply at all. That looked like "commands
+    // work but AI doesn't", with no visible error on the WhatsApp side.
+    // Surfacing the real message here means the next failure is
+    // immediately diagnosable from the chat itself, not just server logs.
+    console.error('[Yuki call failed]', error?.message || error);
+    await this.sendMessage(jid, { text: `⚠️ Couldn't get a reply from the model: ${error?.message || 'unknown error'}` }, { quoted: msg });
+    return;
+  }
   await this.sendMessage(jid, { text: reply }, { quoted: msg });
 }
 
