@@ -90,7 +90,9 @@ fly ssh console -C "printenv" | grep -i yuki   # confirm secrets landed
 fly status                  # machine state, region, health
 ```
 
-For the bot specifically, watch the logs for the WhatsApp QR pairing
-step on first boot — you'll need to scan it once per phone number, same
-as any fresh WhatsApp Web login, and it'll persist afterward on the
-mounted volume.
+For the bot specifically, pairing is NOT QR-based — it uses WhatsApp's
+numeric pairing-code flow. Message the bot on Telegram with /connect
+234xxxxxxxxx (your WhatsApp number with country code); it replies with
+a short code to enter under WhatsApp → Linked Devices → Link a device →
+"Link with phone number instead". That link persists afterward on the
+mounted volume, so it survives redeploys.
