@@ -10,7 +10,15 @@ FROM node:20-slim
 WORKDIR /app
 
 COPY package*.json ./
-RUN npm install --omit=dev
+# npm ci is faster and fully reproducible (exact versions from the
+# lockfile) but requires package-lock.json to exist. Falls back to
+# npm install if there's no lockfile in the repo yet. Either way, `ls`
+# right after prints the resolved dependency tree into the Fly build
+# log so you can confirm packages actually landed, instead of finding
+# out at runtime via a missing-module crash.
+RUN if [ -f package-lock.json ]; then npm ci --omit=dev; else npm install --omit=dev; fi \
+    && echo "--- installed node_modules (top level) ---" \
+    && ls node_modules
 
 COPY . .
 

@@ -69,9 +69,22 @@ primary_region = "iad"   # must match the volume's region
 # this file for why that's intentional, not an oversight.
 
 [[vm]]
-  # This process is lightweight (no model inference happens here — that's
-  # the separate model-server app) — 512MB-1GB is realistic; bump if you
-  # see OOM in `fly logs`.
-  memory = "1gb"
+  # Set to 32GB per explicit request. Note: this process itself (Baileys
+  # socket + Telegram polling, no model inference) genuinely does not
+  # need anywhere near this — 512MB-1GB was the realistic figure. 32GB on
+  # a shared-cpu machine is also an unusual combination Fly may reject or
+  # require a performance/dedicated cpu_kind for; if `fly deploy` errors
+  # on this, switch cpu_kind below to "performance".
+  memory = "32gb"
   cpu_kind = "shared"
   cpus = 1
+
+# Always-on is already correct by construction: this file has no
+# [http_service]/[[services]] block (see note at top), which is what
+# makes Fly's auto-stop-when-idle not apply in the first place — there's
+# no HTTP traffic signal to stop/wake on, so the machine simply stays
+# running once started. The one added guarantee for "always on" is
+# restart-on-host-reboot, which fly.toml itself cannot express — run
+# this once after deploying:
+#   fly machine list
+#   fly machine update --restart always <machine-id>
