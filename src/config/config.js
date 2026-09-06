@@ -10,6 +10,14 @@ export const config = {
   sessionDataPath: required('SESSION_DATA_PATH'),
   telegramBotToken: required('TELEGRAM_BOT_TOKEN'),
   telegramAuthorizedChatIds: (process.env.YUKI_AUTHORIZED_CHAT_IDS || '').split(',').map(v => v.trim()).filter(Boolean).map(Number),
+  // Registered session names treated as admin/owner sessions — bypass
+  // per-user context quotas entirely and are the only sessions allowed
+  // to see the admin half of /menu or use admin-only WhatsApp features.
+  // Telegram-side admin commands (/resetmodel, /setendpoint, etc.) are
+  // gated separately by YUKI_AUTHORIZED_CHAT_IDS above, not this list —
+  // this one is about WhatsApp session identity, that one is about which
+  // Telegram chat can issue control-plane commands at all.
+  adminSessions: (process.env.ADMIN_SESSIONS || 'coralz,yuki').split(',').map(v => v.trim().toLowerCase()).filter(Boolean),
   yukiApiBaseUrl: required('YUKI_API_BASE_URL').replace(/\/$/, ''),
   yukiApiModel: required('YUKI_API_MODEL'),
   yukiApiKey: required('YUKI_API_KEY'),

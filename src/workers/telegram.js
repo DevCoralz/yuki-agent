@@ -19,3 +19,14 @@ export function initializeTelegramBot() {
   });
   return bot;
 }
+
+// Deliberately NOT imported directly by sessionManager.js — that would
+// create a real import cycle (sessionManager -> telegram -> 
+// telegramHandler -> sessionManager, since telegramHandler.js already
+// imports sessionManager.js). Instead app.js (which already imports
+// both modules) injects the bot instance into sessionManager via
+// setNotifier() after initializeTelegramBot() runs, keeping the module
+// graph a clean tree instead of a cycle.
+export function getBotInstance() {
+  return bot;
+}

@@ -11,6 +11,7 @@ import pino from 'pino';
 import { environment } from '../config/environment.js';
 import { sessionStore, detectChat } from '../storage/sessionStore.js';
 import { runYuki } from '../ai/yuki.js';
+import { isAdminSession, getAccessMode, getCtxLimitChars, getCtxResetHours } from '../config/adminConfig.js';
 
 const silentLogger = pino({ level: 'silent' });
 
@@ -82,6 +83,17 @@ async function handleIncomingMessage(msg) {
   const displayName = senderName(msg);
   const session = sessionStore.getByJid(jid);
 
+  // Admin-only mode: unregistered strangers AND any registered non-admin
+  // session are silently ignored (no reply at all — an explicit refusal
+  // would still leak that the bot exists and is just gatekept, which
+  // isn't the point of this switch). Registration itself is blocked too,
+  // not just replies, since letting new sessions register while
+  // admin-only is on would be confusing (they'd register successfully,
+  // then get silence forever). Admin sessions are completely unaffected.
+  if (getAccessMode(sessionStore) === 'adminonly' && !(session && isAdminSession(session))) {
+    return;
+  }
+
   if (!session) {
     if (type === 'group' && !isAddressedInGroup(this, msg, text)) return;
 
@@ -131,6 +143,23 @@ async function handleIncomingMessage(msg) {
   // what keeps it silent during normal group chatter.
   if (type === 'group' && !isAddressedInGroup(this, msg, text)) return;
 
+  // Per-user context quota — admin sessions (ADMIN_SESSIONS) bypass this
+  // entirely regardless of any /setctx value. No quota configured at all
+  // (getCtxLimitChars returns null) means unlimited for everyone, same as
+  // before this feature existed.
+  const isAdmin = isAdminSession(session);
+  const ctxLimit = getCtxLimitChars(sessionStore);
+  if (!isAdmin && ctxLimit) {
+    const resetHours = getCtxResetHours(sessionStore);
+    const usage = sessionStore.getCtxUsage(session.id, resetHours);
+    if (usage.charsUsed >= ctxLimit) {
+      await this.sendMessage(jid, {
+        text: `⏳ You've hit this chat's usage limit for now (resets every ${resetHours}h). Try again later.`,
+      }, { quoted: msg });
+      return;
+    }
+  }
+
   const toolCtx = { sock: this, jid, sourceMsg: msg };
   let reply;
   try {
@@ -153,6 +182,12 @@ async function handleIncomingMessage(msg) {
     console.error('[Yuki call failed]', error?.message || error);
     await this.sendMessage(jid, { text: `⚠️ Couldn't get a reply from the model: ${error?.message || 'unknown error'}` }, { quoted: msg });
     return;
+  }
+  if (!isAdmin && ctxLimit) {
+    // chars/4 ~= tokens is this codebase's existing estimate (the model
+    // endpoint returns no usage field) — counting both the user's message
+    // and the reply, since both cost real context either way.
+    sessionStore.addCtxUsage(session.id, cleanText.length + reply.length);
   }
   await this.sendMessage(jid, { text: reply }, { quoted: msg });
 }
@@ -272,5 +307,5 @@ export async function createWhatsAppSocket(phoneNumber, manager) {
       }
     }
   }
-  return { sock, pairingCode };
+  return { sock, pairingCode, registered: state.creds.registered };
 }

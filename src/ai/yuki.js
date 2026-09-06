@@ -71,7 +71,9 @@ How to talk:
 How to think:
 - For anything with real stakes or complexity — debugging, multi-step tasks, decisions with tradeoffs, math, planning — reason through it carefully step by step before answering, and actually use run_command to check your work when you can (run the code, don't just guess what it does).
 - For simple stuff — a greeting, a joke, a quick fact — just answer. Don't overthink small talk.
-- NEVER report a tool call as successful if its actual result was an error. If list_files, delete_path, or any tool returns an error, say so plainly and either try a different real approach or tell the user it failed — don't guess at what the result probably would have been and present that guess as what happened.`;
+- NEVER report a tool call as successful if its actual result was an error. If list_files, delete_path, or any tool returns an error, say so plainly and either try a different real approach or tell the user it failed — don't guess at what the result probably would have been and present that guess as what happened.
+- If the same approach fails repeatedly (same error, same method, no real progress), don't just keep blindly retrying it — after a few tries, stop and tell the user what's failing and ask whether to try a different approach or drop it. Trying a genuinely different method after a failure is fine and often the right move; grinding the identical failing thing over and over without saying anything is not.
+- If the user says to stop, cancel, or drop something mid-task, stop immediately — don't finish "just one more attempt" first.`;
 }
 
 async function buildMessages(session, userText, participantJid, participantName) {
@@ -161,9 +163,30 @@ async function callModel(messages, modelId) {
  * run commands. progress(status) is only called on tool *errors* now —
  * routine tool calls stay silent (the typing indicator already shows
  * the bot is working) instead of narrating every step.
+ *
+ * MAX_CONSECUTIVE_FAILURES exists separately from yukiMaxToolRounds:
+ * the round limit caps TOTAL tool-call rounds per message (default 12),
+ * but nothing previously stopped the model from spending all 12 of
+ * those rounds retrying the exact same failing approach — e.g. a login
+ * attempt that keeps failing the same way. This tracks failures IN A
+ * ROW (reset to 0 by any successful tool call, since a fresh success
+ * means it's not stuck) and, once that streak hits the threshold,
+ * breaks out of the loop and hands control back with a clear summary —
+ * not a silent stall, not another 7 rounds of the same failing retry.
+ * The model can still keep trying past one failure (that's normal and
+ * expected — only a STREAK stops it), and a plain "stop" from the user
+ * mid-task should end the loop even before the streak limit, which is
+ * handled by checking the user's own latest message for a stop word
+ * before running another round.
  */
+const MAX_CONSECUTIVE_TOOL_FAILURES = 5;
+const STOP_WORD_PATTERN = /\b(stop|cancel|abort|never\s*mind|nevermind|forget it|that'?s enough|enough)\b/i;
+
 export async function runYuki(session, userText, participantJid, participantName, toolCtx = {}, progress = async () => {}) {
   const messages = await buildMessages(session, userText, participantJid, participantName);
+
+  let consecutiveFailures = 0;
+  let lastFailureSummaries = [];
 
   for (let round = 0; round < environment.yukiMaxToolRounds; round++) {
     const message = await callModel(messages, resolveApiModel(sessionStore));
@@ -182,16 +205,46 @@ export async function runYuki(session, userText, participantJid, participantName
 
     messages.push({ role: 'assistant', content: message.content || null, tool_calls: calls });
 
+    let anySucceededThisRound = false;
     for (const call of calls) {
       let result;
       try {
         const args = JSON.parse(call.function.arguments || '{}');
         result = await executeTool(call.function.name, args, { session, participantJid, participantName, ...toolCtx });
+        if (!result?.error) anySucceededThisRound = true;
       } catch (e) {
         result = { error: e?.message || 'Tool execution failed.' };
         await progress(`Hit an issue on that step: ${e?.message || 'unknown error'}. Trying another way.`);
       }
+      if (result?.error) {
+        lastFailureSummaries.push(`${call.function.name}: ${result.error}`.slice(0, 200));
+      }
       messages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify(result) });
+    }
+
+    consecutiveFailures = anySucceededThisRound ? 0 : consecutiveFailures + 1;
+
+    if (consecutiveFailures >= MAX_CONSECUTIVE_TOOL_FAILURES) {
+      const recap = [...new Set(lastFailureSummaries.slice(-MAX_CONSECUTIVE_TOOL_FAILURES))].join('\n');
+      const reply = markdownToWhatsApp(
+        `That approach failed ${consecutiveFailures} times in a row, so I'll stop here instead of continuing to retry the same thing:\n\n${recap}\n\nWant me to try a different approach, or should I drop it?`,
+      );
+      sessionStore.recordMemory(session, 'assistant', reply);
+      await sessionStore.appendChat(session, { role: 'assistant', content: reply, at: new Date().toISOString() });
+      return reply;
+    }
+
+    // A mid-task "stop" from the user (checked in their most recent real
+    // message, not the tool-injected messages) should end this immediately
+    // rather than waiting for the failure streak or the round limit —
+    // the streak counter alone wouldn't catch a case where the model is
+    // technically succeeding at retrying (e.g. successfully re-navigating)
+    // but the user has already said they want it to stop.
+    if (STOP_WORD_PATTERN.test(userText)) {
+      const reply = markdownToWhatsApp('Stopped — let me know if you want to try a different approach.');
+      sessionStore.recordMemory(session, 'assistant', reply);
+      await sessionStore.appendChat(session, { role: 'assistant', content: reply, at: new Date().toISOString() });
+      return reply;
     }
   }
 

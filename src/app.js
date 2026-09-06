@@ -1,12 +1,13 @@
 import 'dotenv/config';
-import { initializeTelegramBot } from './workers/telegram.js';
-import { sessionManager } from './workers/sessionManager.js';
+import { initializeTelegramBot, getBotInstance } from './workers/telegram.js';
+import { sessionManager, setNotifier } from './workers/sessionManager.js';
 import { sessionStore } from './storage/sessionStore.js';
 
 async function main() {
   await sessionManager.init();
   await sessionStore.init();
   initializeTelegramBot();
+  setNotifier(getBotInstance());
   await sessionManager.restoreSessions();
   console.log('Telegram pairing service online — SINGLE WHATSAPP SESSION ONLY.');
 }

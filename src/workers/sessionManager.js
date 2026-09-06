@@ -5,6 +5,26 @@ import { createWhatsAppSocket } from './whatsapp.js';
 
 const META_FILE = 'pairing-meta.json';
 
+// Injected from app.js after initializeTelegramBot() runs — see the
+// comment in telegram.js's getBotInstance() for why this isn't a direct
+// import (would create a real module cycle via telegramHandler.js).
+let notifierBot = null;
+export function setNotifier(botInstance) {
+  notifierBot = botInstance;
+}
+
+async function notifyRestoreFailed(chatId, phoneNumber, message) {
+  if (!notifierBot || !chatId) return;
+  try {
+    await notifierBot.sendMessage(chatId, `⚠️ +${phoneNumber}: ${message}`);
+  } catch (error) {
+    // Best-effort — if Telegram itself is unreachable, fall back to the
+    // server log, which is still better than nothing, but shouldn't
+    // throw and abort the rest of restoreSessions().
+    console.error('[WhatsApp] Could not send restore-failure notification:', error?.message || error);
+  }
+}
+
 class SessionManager {
   constructor() {
     this.session = null;
@@ -161,6 +181,32 @@ class SessionManager {
     if (!this.meta?.phoneNumber) return;
 
     try {
+      // pairingRequested: true is set BEFORE the call, not after — this
+      // is the actual fix. createWhatsAppSocket only skips requesting a
+      // brand-new pairing code when manager.wasPairingRequested() is
+      // already true at the moment it runs; setting this.session with
+      // pairingRequested:true only after the call returns meant
+      // wasPairingRequested() read a still-null this.session during
+      // restore and returned false, so any restore where
+      // state.creds.registered came back false (e.g. the Baileys creds
+      // file was mid-write when the process was killed, so it read back
+      // corrupted/incomplete) silently requested a FRESH pairing code
+      // instead of attempting to reconnect the existing link — a code
+      // nobody was watching for, since this isn't a Telegram-initiated
+      // /connect. From WhatsApp's side the device stays listed as linked
+      // (nothing explicitly logged it out) but the bot-side session was
+      // actually a dead, orphaned socket waiting on a connection that was
+      // never coming — exactly "device still linked, bot never
+      // reconnects". Setting the session (with pairingRequested: true)
+      // before the call makes wasPairingRequested() correctly read true
+      // during restore, so a restore NEVER silently issues a new code.
+      this.session = {
+        sock: null,
+        phoneNumber: this.meta.phoneNumber,
+        telegramChatId: this.meta.telegramChatId ?? null,
+        pairingRequested: true,
+        connected: false,
+      };
       const result = await createWhatsAppSocket(this.meta.phoneNumber, this);
       this.session = {
         sock: result.sock,
@@ -169,8 +215,29 @@ class SessionManager {
         pairingRequested: true,
         connected: false,
       };
+
+      // If Baileys itself reports the restored creds as unregistered,
+      // that's the corrupted-creds scenario above — surface it to
+      // Telegram explicitly rather than leaving a dead socket running
+      // silently. The person needs to know a real /connect is required;
+      // WhatsApp still showing the device as "linked" on the phone is
+      // not evidence the bot side actually has a working session.
+      if (result.registered === false && this.meta.telegramChatId) {
+        await notifyRestoreFailed(
+          this.meta.telegramChatId,
+          this.meta.phoneNumber,
+          'The saved WhatsApp session looks incomplete after the restart (this can happen if the process was killed mid-write). Your phone may still show the device as linked, but this bot cannot use that link anymore — use /disconnect then /connect to re-pair.',
+        );
+      }
     } catch (error) {
       console.error('[WhatsApp] Could not restore the single session:', error?.message || error);
+      if (this.meta?.telegramChatId) {
+        await notifyRestoreFailed(
+          this.meta.telegramChatId,
+          this.meta.phoneNumber,
+          `Couldn't restore the WhatsApp session after restart: ${error?.message || 'unknown error'}. Use /disconnect then /connect to re-pair.`,
+        );
+      }
     }
   }
 }

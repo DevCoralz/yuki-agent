@@ -71,7 +71,50 @@ export class SessionStore {
         value TEXT NOT NULL,
         updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_by_jid TEXT
+      );
+      CREATE TABLE IF NOT EXISTS ctx_usage (
+        session_id INTEGER PRIMARY KEY,
+        chars_used INTEGER NOT NULL DEFAULT 0,
+        window_started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(session_id) REFERENCES chat_sessions(id) ON DELETE CASCADE
       );`);
+  }
+
+  /**
+   * Per-session rolling context quota — separate from runtime_config
+   * (bot-wide settings) since this is per-session USAGE, not a setting.
+   * The window auto-resets (chars_used back to 0, window_started_at bumped
+   * to now) the first time it's checked after resetHours have elapsed —
+   * no cron/scheduler needed, it just self-heals on next use. addChars is
+   * called after a successful model reply with that reply's char count
+   * (chars/4 is this codebase's existing token estimate, used elsewhere
+   * for the same apis.coralz.de5.net-style endpoint that has no usage
+   * field of its own).
+   */
+  getCtxUsage(sessionId, resetHours) {
+    const row = this.db.prepare('SELECT chars_used, window_started_at FROM ctx_usage WHERE session_id = ?').get(sessionId);
+    if (!row) {
+      this.db.prepare('INSERT INTO ctx_usage (session_id, chars_used, window_started_at) VALUES (?, 0, CURRENT_TIMESTAMP)').run(sessionId);
+      return { charsUsed: 0, windowStartedAt: new Date().toISOString() };
+    }
+    const windowAgeMs = Date.now() - new Date(row.window_started_at + 'Z').getTime();
+    if (windowAgeMs > resetHours * 60 * 60 * 1000) {
+      this.db.prepare('UPDATE ctx_usage SET chars_used = 0, window_started_at = CURRENT_TIMESTAMP WHERE session_id = ?').run(sessionId);
+      return { charsUsed: 0, windowStartedAt: new Date().toISOString() };
+    }
+    return { charsUsed: row.chars_used, windowStartedAt: row.window_started_at };
+  }
+
+  addCtxUsage(sessionId, chars) {
+    this.db.prepare('UPDATE ctx_usage SET chars_used = chars_used + ? WHERE session_id = ?').run(Math.max(0, chars | 0), sessionId);
+  }
+
+  resetCtxUsage(sessionId) {
+    this.db.prepare('UPDATE ctx_usage SET chars_used = 0, window_started_at = CURRENT_TIMESTAMP WHERE session_id = ?').run(sessionId);
+  }
+
+  resetAllCtxUsage() {
+    this.db.prepare('UPDATE ctx_usage SET chars_used = 0, window_started_at = CURRENT_TIMESTAMP').run();
   }
 
   /**
@@ -94,6 +137,17 @@ export class SessionStore {
 
   getAllRuntimeConfig() {
     return this.db.prepare('SELECT key,value,updated_at,updated_by_jid FROM runtime_config ORDER BY key').all();
+  }
+
+  /**
+   * Deletes a runtime_config row entirely (not just sets it empty) — used
+   * by /resetmodel to revert to .env/Fly-secret defaults. resolveApiBaseUrl
+   * etc. (runtimeConfig.js) already do `getRuntimeConfig(key) ||
+   * environment.xyz`, and a missing row returns null from getRuntimeConfig,
+   * which correctly falls through to the .env default.
+   */
+  clearRuntimeConfig(key) {
+    this.db.prepare('DELETE FROM runtime_config WHERE key = ?').run(String(key).trim());
   }
 
   getByJid(jid) { return this.db.prepare('SELECT * FROM chat_sessions WHERE jid = ?').get(jid) || null; }

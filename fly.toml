@@ -46,6 +46,13 @@ primary_region = "iad"   # must match the volume's region
   YUKI_MAX_TOOL_ROUNDS = "12"
   YUKI_HISTORY_MESSAGES = "12"
   YUKI_MAX_FILE_BYTES = "512000"
+  # Registered WhatsApp session names treated as admins — see /menu,
+  # /setctx, /adminonly. Not a secret (it's just names, not credentials),
+  # so it lives here rather than as a Fly secret. Everything these names
+  # actually unlock (model overrides, access mode, quotas) is set via
+  # Telegram commands and stored in registry.sqlite on the mounted
+  # volume — not here — so it survives redeploys without touching this file.
+  ADMIN_SESSIONS = "coralz,yuki"
   # Update this to wherever the model server app actually deploys — Fly
   # apps can reach each other over the private network at
   # <app-name>.internal, avoiding public internet round-trips entirely if

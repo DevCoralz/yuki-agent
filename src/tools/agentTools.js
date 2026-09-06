@@ -6,6 +6,7 @@ import { tagUsers } from './tagTools.js';
 import { sessionStore } from '../storage/sessionStore.js';
 import { environment } from '../config/environment.js';
 import { RUNTIME_CONFIG_KEYS } from '../ai/runtimeConfig.js';
+import { isAdminSession } from '../config/adminConfig.js';
 
 const cwdDescription = 'Optional working directory relative to the session workspace root.';
 
@@ -402,10 +403,11 @@ export async function executeTool(name, args, ctx) {
   if (name === 'set_model_config' || name === 'get_model_config') {
     // Real security gate, enforced in code — never delegated to the
     // model's own judgment about whether a request "seems legitimate".
-    const isPrivilegedSession = ['coralz', 'yuki'].includes(
-      String(session.registered_name || '').toLowerCase()
-    );
-    if (!isPrivilegedSession) {
+    // Backed by ADMIN_SESSIONS (config.js), configurable without a code
+    // change — same admin-session list /menu, /setctx, and the WhatsApp
+    // admin-only mode all use, so there's one source of truth for "who
+    // counts as an admin session" across the whole bot.
+    if (!isAdminSession(session)) {
       return { ok: false, error: 'This session is not authorized to view or change model configuration.' };
     }
 
