@@ -9,7 +9,7 @@
     "start": "node src/app.js",
     "smoke": "node scripts/smoke-test.js"
   },
-  "engines": { "node": ">=20.0.0" },
+  "engines": { "node": ">=22.5.0" },
   "dependencies": {
     "@hapi/boom": "^10.0.1",
     "@whiskeysockets/baileys": "^7.0.0-rc11",

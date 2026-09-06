@@ -5,7 +5,16 @@
 # must run as an always-on machine, not Fly's auto-stop-on-idle-HTTP
 # pattern (which doesn't apply here anyway, since there's no HTTP traffic
 # to trigger wake/sleep on in the first place).
-FROM node:20-slim
+#
+# MUST be Node 22+ (not 20): src/storage/sessionStore.js imports the
+# built-in `node:sqlite` module, which does not exist at all in Node 20 —
+# it was only added in Node 22.5.0, and needs 22.13+ to run without the
+# --experimental-sqlite flag. Node 20 threw exactly this at boot:
+#   Error [ERR_UNKNOWN_BUILTIN_MODULE]: No such built-in module: node:sqlite
+# which crash-looped the machine (Fly Doctor: "machines restarting a lot").
+# 22-slim is current Node LTS (maintained into 2027), so this isn't a
+# stopgap version bump.
+FROM node:22-slim
 
 WORKDIR /app
 
