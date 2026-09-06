@@ -12,6 +12,7 @@ import { environment } from '../config/environment.js';
 import { sessionStore, detectChat } from '../storage/sessionStore.js';
 import { runYuki } from '../ai/yuki.js';
 import { isAdminSession, getAccessMode, getCtxLimitChars, getCtxResetHours } from '../config/adminConfig.js';
+import { buildMenuText, dispatchAdminCommand } from '../config/adminCommands.js';
 
 const silentLogger = pino({ level: 'silent' });
 
@@ -128,6 +129,42 @@ async function handleIncomingMessage(msg) {
 
     await this.sendMessage(jid, { text: '👋 Before we can chat here, please register this chat.\n\nUse: /register <name>' });
     return;
+  }
+
+  // Real command handling for registered sessions — WITHOUT this, /menu
+  // and every other admin command (/setctx, /resetmodel, /setendpoint,
+  // etc.) typed on WhatsApp were never intercepted at all: they fell
+  // straight through to the AI like ordinary chat text, and the model
+  // just improvised a plausible-looking reply from its system prompt
+  // (different wording each time, no real command list behind it) —
+  // which is exactly what was happening before this. In groups, gated
+  // behind the same isAddressedInGroup check the AI reply path already
+  // uses — without it, ANY group member typing a command-prefixed
+  // aside (not meant for the bot at all) would trigger real command
+  // dispatch, including admin commands from non-admins (harmless
+  // "not enabled" replies, but still noisy and unexpected). Checked
+  // BEFORE the per-user quota logic since a command is not a chat
+  // message and shouldn't count against anyone's context quota.
+  // isAdminSession(session) is the WhatsApp-side authorization boundary
+  // (see adminCommands.js header) — unrelated to Telegram's chat-ID
+  // allowlist, since there's no equivalent concept here.
+  if (text.startsWith(environment.commandPrefix) && (type !== 'group' || isAddressedInGroup(this, msg, text))) {
+    const [command, ...args] = text.split(/\s+/);
+    const cmdName = command.slice(environment.commandPrefix.length).toLowerCase();
+    const rest = text.slice(command.length).trim();
+    const reply = (t) => this.sendMessage(jid, { text: t });
+    const isAdmin = isAdminSession(session);
+
+    if (cmdName === 'menu') {
+      await reply(buildMenuText(isAdmin));
+      return;
+    }
+
+    const handled = await dispatchAdminCommand(cmdName, args, rest, reply, isAdmin, participantJid);
+    if (handled) return;
+    // Not a recognized command (e.g. "/register" again, already handled
+    // above, or genuinely unknown) — fall through to the AI as before,
+    // same as any command-prefixed text always did.
   }
 
   const botNumber = this.user?.id?.split(':')[0] || '';
