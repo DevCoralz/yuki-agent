@@ -69,15 +69,26 @@ primary_region = "iad"   # must match the volume's region
 # this file for why that's intentional, not an oversight.
 
 [[vm]]
-  # Set to 32GB per explicit request. Note: this process itself (Baileys
-  # socket + Telegram polling, no model inference) genuinely does not
-  # need anywhere near this — 512MB-1GB was the realistic figure. 32GB on
-  # a shared-cpu machine is also an unusual combination Fly may reject or
-  # require a performance/dedicated cpu_kind for; if `fly deploy` errors
-  # on this, switch cpu_kind below to "performance".
+  # Set to 32GB per explicit request. This REQUIRES performance CPUs —
+  # confirmed against your actual deploy error ("cannot exceed 2048 MiB"):
+  # Fly caps shared-CPU machines at 2GB of memory PER CPU (so 1 shared
+  # CPU = 2048 MiB max, which is exactly the limit the error reported).
+  # Performance CPUs cap at 8GB per CPU instead, so reaching 32GB needs
+  # cpu_kind = "performance" with cpus = 4 (4 x 8gb = 32gb) — that's the
+  # combination below.
+  #
+  # Cost note, stated plainly because this is a real jump: performance
+  # CPUs are dedicated, not shared/bursty, and billed accordingly — a
+  # performance-4x/32gb machine run always-on is a materially bigger
+  # monthly cost than the 1 shared-cpu/1gb this process actually needs
+  # (Baileys socket + Telegram polling, no model inference happens here).
+  # If 32GB was requested for headroom rather than a specific measured
+  # need, it's worth double-checking this is the intended app — the
+  # separate model-server app (DevCoralz_api) is the one more likely to
+  # actually need this much memory.
   memory = "32gb"
-  cpu_kind = "shared"
-  cpus = 1
+  cpu_kind = "performance"
+  cpus = 4
 
 # Always-on is already correct by construction: this file has no
 # [http_service]/[[services]] block (see note at top), which is what
