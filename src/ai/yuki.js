@@ -4,6 +4,7 @@ import { tools, executeTool } from '../tools/agentTools.js';
 import { sanitizeIdentityLeak } from './identityFilter.js';
 import { markdownToWhatsApp } from './whatsappFormat.js';
 import { resolveApiBaseUrl, resolveApiKey, resolveApiModel } from './runtimeConfig.js';
+import { killBackgroundJobs } from '../tools/terminal.js';
 
 // Chat templates differ in what role sequences they accept. Qwen's template
 // tolerates multiple leading `system` messages and has native `tool` role
@@ -161,9 +162,15 @@ async function callModel(messages, modelId) {
 /**
  * toolCtx: { sock, jid, sourceMsg } — passed straight through to
  * executeTool alongside session, so tools can send/receive files and
- * run commands. progress(status) is only called on tool *errors* now —
- * routine tool calls stay silent (the typing indicator already shows
- * the bot is working) instead of narrating every step.
+ * run commands. `progress` is accepted for call-signature compatibility
+ * with whatsapp.js but is no longer invoked per tool-call attempt — it
+ * used to send a "Hit an issue on that step... Trying another way"
+ * message on every single failure, which meant a command that failed
+ * (or a backgrounded job that made the tool call hang/timeout) produced
+ * a stream of repeated, near-identical error messages instead of one
+ * clear report. Now the user gets exactly one message, after the
+ * consecutive-failure threshold trips, with the FULL real error detail
+ * from every attempt — not a summary, not a repeated generic line.
  *
  * MAX_CONSECUTIVE_FAILURES exists separately from yukiMaxToolRounds:
  * the round limit caps TOTAL tool-call rounds per message (default 12),
@@ -172,18 +179,42 @@ async function callModel(messages, modelId) {
  * attempt that keeps failing the same way. This tracks failures IN A
  * ROW (reset to 0 by any successful tool call, since a fresh success
  * means it's not stuck) and, once that streak hits the threshold,
- * breaks out of the loop and hands control back with a clear summary —
+ * breaks out of the loop and hands control back with the full detail —
  * not a silent stall, not another 7 rounds of the same failing retry.
  * The model can still keep trying past one failure (that's normal and
- * expected — only a STREAK stops it), and a plain "stop" from the user
- * mid-task should end the loop even before the streak limit, which is
- * handled by checking the user's own latest message for a stop word
- * before running another round.
+ * expected — only a STREAK stops it).
  */
 const MAX_CONSECUTIVE_TOOL_FAILURES = 5;
-const STOP_WORD_PATTERN = /\b(stop|cancel|abort|never\s*mind|nevermind|forget it|that'?s enough|enough)\b/i;
+const STOP_WORD_PATTERN = /\b(stop|cancel|abort|never\s*mind|nevermind|forget it|that'?s enough|enough|ctrl\s*[+\-]?\s*c)\b/i;
 
 export async function runYuki(session, userText, participantJid, participantName, toolCtx = {}, progress = async () => {}) {
+  // CODE-LEVEL stop, checked BEFORE any model call — deliberately not
+  // something the model decides to honor. The earlier version only
+  // checked this AFTER a full round of tool calls had already run, and
+  // only produced a text reply claiming "stopped"/"cleared" without
+  // actually killing anything — which is exactly how a real incident
+  // played out: a backgrounded loop kept running for many minutes while
+  // the model repeatedly said "no commands running" / "cleared the
+  // workspace entirely", because nothing in the code path ever actually
+  // reached the background process to kill it; the model was reporting
+  // what it assumed, not what was true. This now calls
+  // killBackgroundJobs() directly — a real, code-enforced kill — and
+  // reports the ACTUAL count killed, before the model ever gets a turn
+  // to say anything about it.
+  if (STOP_WORD_PATTERN.test(userText)) {
+    const { killed, alreadyDead } = killBackgroundJobs(session.id);
+    const reply = markdownToWhatsApp(
+      killed > 0
+        ? `Stopped. Killed ${killed} running background job${killed === 1 ? '' : 's'}.`
+        : alreadyDead > 0
+          ? 'Nothing was actually still running (any earlier background job had already ended) — but stopping here as asked.'
+          : "Stopped — there wasn't a background job to kill, but I won't run anything further for this message.",
+    );
+    sessionStore.recordMemory(session, 'assistant', reply);
+    await sessionStore.appendChat(session, { role: 'assistant', content: reply, at: new Date().toISOString() });
+    return reply;
+  }
+
   const messages = await buildMessages(session, userText, participantJid, participantName);
 
   let consecutiveFailures = 0;
@@ -215,10 +246,9 @@ export async function runYuki(session, userText, participantJid, participantName
         if (!result?.error) anySucceededThisRound = true;
       } catch (e) {
         result = { error: e?.message || 'Tool execution failed.' };
-        await progress(`Hit an issue on that step: ${e?.message || 'unknown error'}. Trying another way.`);
       }
       if (result?.error) {
-        lastFailureSummaries.push(`${call.function.name}: ${result.error}`.slice(0, 200));
+        lastFailureSummaries.push(`${call.function.name}: ${result.error}`.slice(0, 300));
       }
       messages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify(result) });
     }
@@ -226,23 +256,16 @@ export async function runYuki(session, userText, participantJid, participantName
     consecutiveFailures = anySucceededThisRound ? 0 : consecutiveFailures + 1;
 
     if (consecutiveFailures >= MAX_CONSECUTIVE_TOOL_FAILURES) {
-      const recap = [...new Set(lastFailureSummaries.slice(-MAX_CONSECUTIVE_TOOL_FAILURES))].join('\n');
+      // Full, un-summarized failure detail, exactly as it came back from
+      // each tool — not a spammy repeated "hit an issue, trying another
+      // way" per attempt (that per-attempt narration is removed entirely;
+      // see the loop above, which no longer calls progress() on error at
+      // all). One clear report, once, with everything that actually
+      // failed and why.
+      const recap = lastFailureSummaries.join('\n\n');
       const reply = markdownToWhatsApp(
-        `That approach failed ${consecutiveFailures} times in a row, so I'll stop here instead of continuing to retry the same thing:\n\n${recap}\n\nWant me to try a different approach, or should I drop it?`,
+        `That approach failed ${consecutiveFailures} times in a row, so I stopped instead of continuing to retry it. Here's exactly what happened each time:\n\n${recap}\n\nWant me to try a different approach, or drop it?`,
       );
-      sessionStore.recordMemory(session, 'assistant', reply);
-      await sessionStore.appendChat(session, { role: 'assistant', content: reply, at: new Date().toISOString() });
-      return reply;
-    }
-
-    // A mid-task "stop" from the user (checked in their most recent real
-    // message, not the tool-injected messages) should end this immediately
-    // rather than waiting for the failure streak or the round limit —
-    // the streak counter alone wouldn't catch a case where the model is
-    // technically succeeding at retrying (e.g. successfully re-navigating)
-    // but the user has already said they want it to stop.
-    if (STOP_WORD_PATTERN.test(userText)) {
-      const reply = markdownToWhatsApp('Stopped — let me know if you want to try a different approach.');
       sessionStore.recordMemory(session, 'assistant', reply);
       await sessionStore.appendChat(session, { role: 'assistant', content: reply, at: new Date().toISOString() });
       return reply;

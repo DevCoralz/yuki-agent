@@ -47,7 +47,7 @@ export class SessionStore {
       CREATE TABLE IF NOT EXISTS chat_sessions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         jid TEXT NOT NULL UNIQUE,
-        type TEXT NOT NULL CHECK(type IN ('dm','group')),
+        type TEXT NOT NULL CHECK(type IN ('dm','group','telegram')),
         registered_name TEXT NOT NULL UNIQUE COLLATE NOCASE,
         session_path TEXT NOT NULL,
         workspace_path TEXT NOT NULL,
@@ -78,6 +78,78 @@ export class SessionStore {
         window_started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY(session_id) REFERENCES chat_sessions(id) ON DELETE CASCADE
       );`);
+
+    // The CHECK(type IN (...)) constraint above only takes effect on a
+    // FRESH create — an existing chat_sessions table on disk (this DB
+    // lives on the mounted Fly volume and survives redeploys, so that's
+    // the normal case for anyone who deployed before this change, not a
+    // fresh empty one) keeps whatever CHECK constraint it was originally
+    // created with. SQLite has no ALTER TABLE for modifying a CHECK
+    // constraint directly — the officially documented way to change one
+    // is: rename the old table, create a new one with the constraint you
+    // want, copy the data across, drop the old table. This adds
+    // 'telegram' as a valid type, needed so a Telegram chat can register
+    // a session the same way a WhatsApp DM does (shared registered_name
+    // namespace, one identity across both platforms, per an explicit
+    // design request). Runs once — after the rebuild, sqlite_master's own
+    // CHECK clause already says 'telegram', so this comparison is false
+    // on every later boot and the whole block is skipped.
+    //
+    // The old table being migrated may or may not already have the
+    // banned/banned_at/banned_by columns (depends whether it was booted
+    // at least once after THAT migration was added, before this one) —
+    // explicit column names handles both cases correctly, unlike
+    // `INSERT INTO x SELECT *`, which breaks the instant the two tables'
+    // column counts don't match exactly (this was caught in testing: a
+    // fresh 9-column table hit a "12 columns but 9 values" error against
+    // a blind SELECT *).
+    const currentCheck = this.db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='chat_sessions'").get()?.sql || '';
+    if (currentCheck.includes("'dm','group'") && !currentCheck.includes('telegram')) {
+      const oldColumns = this.db.prepare('PRAGMA table_info(chat_sessions)').all().map(c => c.name);
+      const hasBanned = oldColumns.includes('banned');
+      this.db.exec(`
+        ALTER TABLE chat_sessions RENAME TO chat_sessions_old_migrating;
+        CREATE TABLE chat_sessions (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          jid TEXT NOT NULL UNIQUE,
+          type TEXT NOT NULL CHECK(type IN ('dm','group','telegram')),
+          registered_name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+          session_path TEXT NOT NULL,
+          workspace_path TEXT NOT NULL,
+          memory_db_path TEXT NOT NULL,
+          chat_json_path TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          banned INTEGER NOT NULL DEFAULT 0,
+          banned_at TEXT,
+          banned_by TEXT
+        );
+        INSERT INTO chat_sessions (id,jid,type,registered_name,session_path,workspace_path,memory_db_path,chat_json_path,created_at${hasBanned ? ',banned,banned_at,banned_by' : ''})
+          SELECT id,jid,type,registered_name,session_path,workspace_path,memory_db_path,chat_json_path,created_at${hasBanned ? ',banned,banned_at,banned_by' : ''}
+          FROM chat_sessions_old_migrating;
+        DROP TABLE chat_sessions_old_migrating;
+      `);
+    }
+
+    // CREATE TABLE IF NOT EXISTS does not retroactively add a column to
+    // a chat_sessions table that already exists on disk (this DB lives
+    // on the mounted Fly volume and survives redeploys, so a real
+    // pre-existing registry.sqlite is the normal case here, not a fresh
+    // empty one) — needs an explicit ALTER TABLE, same pattern already
+    // used for memory_facts.deleted_at above. Still needed even after
+    // the rebuild above, for any database that predates BOTH migrations
+    // (rebuild already includes these columns for anyone rebuilt just
+    // now, so this is a no-op in that case — PRAGMA table_info confirms
+    // either way rather than assuming).
+    const sessionColumns = this.db.prepare('PRAGMA table_info(chat_sessions)').all().map(c => c.name);
+    if (!sessionColumns.includes('banned')) {
+      this.db.exec('ALTER TABLE chat_sessions ADD COLUMN banned INTEGER NOT NULL DEFAULT 0;');
+    }
+    if (!sessionColumns.includes('banned_at')) {
+      this.db.exec('ALTER TABLE chat_sessions ADD COLUMN banned_at TEXT;');
+    }
+    if (!sessionColumns.includes('banned_by')) {
+      this.db.exec('ALTER TABLE chat_sessions ADD COLUMN banned_by TEXT;');
+    }
   }
 
   /**
@@ -152,6 +224,37 @@ export class SessionStore {
 
   getByJid(jid) { return this.db.prepare('SELECT * FROM chat_sessions WHERE jid = ?').get(jid) || null; }
   getByName(name) { return this.db.prepare('SELECT * FROM chat_sessions WHERE registered_name = ? COLLATE NOCASE').get(name) || null; }
+
+  listSessions() {
+    return this.db.prepare('SELECT id, registered_name, type, banned, banned_at, created_at FROM chat_sessions ORDER BY created_at DESC').all();
+  }
+
+  /**
+   * banByName/unbanByName look up by registered_name (case-insensitive,
+   * matching getByName) rather than requiring a jid, since /ban and
+   * /unban are meant to be usable by name from a completely different
+   * chat (an admin banning someone doesn't need that person's raw jid
+   * on hand). actorId is whoever ran the command, recorded for
+   * accountability the same way runtime_config already tracks
+   * updated_by_jid.
+   */
+  banByName(name, actorId) {
+    const session = this.getByName(name);
+    if (!session) return { ok: false, code: 'not_found' };
+    this.db.prepare('UPDATE chat_sessions SET banned = 1, banned_at = CURRENT_TIMESTAMP, banned_by = ? WHERE id = ?').run(String(actorId ?? ''), session.id);
+    return { ok: true, session };
+  }
+
+  unbanByName(name) {
+    const session = this.getByName(name);
+    if (!session) return { ok: false, code: 'not_found' };
+    this.db.prepare('UPDATE chat_sessions SET banned = 0, banned_at = NULL, banned_by = NULL WHERE id = ?').run(session.id);
+    return { ok: true, session };
+  }
+
+  isBanned(session) {
+    return Boolean(session?.banned);
+  }
 
   async register(jid, type, name) {
     const registeredName = safeName(name);

@@ -40,6 +40,10 @@ const ADMIN_MENU_EXTRA_LINES = [
   '/setkey <key> — set live API key',
   '/adminonly — only admin sessions get replies',
   '/everyone — all sessions get replies (default)',
+  '/sessions — list every registered session',
+  '/ban <session-name> — banned sessions get zero reply, ever',
+  '/unban <session-name>',
+  '/broadcast <message> — send to every registered WhatsApp session (WhatsApp only; can attach an image as caption)',
 ];
 
 /**
@@ -129,6 +133,35 @@ export async function cmdAccessMode(reply, isAuthorized, mode, actorId) {
   );
 }
 
+export async function cmdSessions(reply, isAuthorized) {
+  if (!isAuthorized) { await reply('This command is not enabled for this chat.'); return; }
+  const sessions = sessionStore.listSessions();
+  if (!sessions.length) { await reply('No registered sessions yet.'); return; }
+  const lines = sessions.map(s => {
+    const tag = s.banned ? '🚫 BANNED' : (environment.adminSessions.includes(String(s.registered_name).toLowerCase()) ? '👑 admin' : '');
+    return `• ${s.registered_name} (${s.type})${tag ? ` — ${tag}` : ''}`;
+  });
+  await reply(`📋 *Registered sessions* (${sessions.length})\n\n${lines.join('\n')}`);
+}
+
+export async function cmdBan(reply, isAuthorized, rawName, actorId) {
+  if (!isAuthorized) { await reply('This command is not enabled for this chat.'); return; }
+  const name = String(rawName || '').trim();
+  if (!name) { await reply('❌ Usage: /ban <session-name>'); return; }
+  const result = sessionStore.banByName(name, actorId);
+  if (!result.ok) { await reply(`❌ No registered session named "${name}".`); return; }
+  await reply(`🚫 "${result.session.registered_name}" is now banned — no replies at all until /unban.`);
+}
+
+export async function cmdUnban(reply, isAuthorized, rawName) {
+  if (!isAuthorized) { await reply('This command is not enabled for this chat.'); return; }
+  const name = String(rawName || '').trim();
+  if (!name) { await reply('❌ Usage: /unban <session-name>'); return; }
+  const result = sessionStore.unbanByName(name);
+  if (!result.ok) { await reply(`❌ No registered session named "${name}".`); return; }
+  await reply(`✅ "${result.session.registered_name}" is unbanned.`);
+}
+
 /**
  * Dispatches a single admin command by name. Returns true if `name`
  * matched a known admin command (whether or not it succeeded/was
@@ -145,6 +178,9 @@ export async function dispatchAdminCommand(name, args, rest, reply, isAuthorized
     case 'setkey': await cmdSetKey(reply, isAuthorized, rest, actorId); return true;
     case 'adminonly': await cmdAccessMode(reply, isAuthorized, 'adminonly', actorId); return true;
     case 'everyone': await cmdAccessMode(reply, isAuthorized, 'everyone', actorId); return true;
+    case 'sessions': await cmdSessions(reply, isAuthorized); return true;
+    case 'ban': await cmdBan(reply, isAuthorized, args[0], actorId); return true;
+    case 'unban': await cmdUnban(reply, isAuthorized, args[0]); return true;
     default: return false;
   }
 }

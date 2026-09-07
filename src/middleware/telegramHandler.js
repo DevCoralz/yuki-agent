@@ -2,7 +2,18 @@ import { environment } from '../config/environment.js';
 import { sessionManager } from '../workers/sessionManager.js';
 import { formatPairingCode, validatePhoneNumber } from '../utils/phone.js';
 import { buildMenuText, dispatchAdminCommand } from '../config/adminCommands.js';
+import { sessionStore } from '../storage/sessionStore.js';
+import { isAdminSession, getAccessMode } from '../config/adminConfig.js';
+import { runYuki } from '../ai/yuki.js';
+import { markdownToTelegram } from '../ai/telegramFormat.js';
 
+// WhatsApp pairing (/connect, /disconnect) stays restricted to
+// YUKI_AUTHORIZED_CHAT_IDS — this is the "only allowed chat id can pair
+// WhatsApp" boundary. isAdminSession/ADMIN_SESSIONS below is a SEPARATE,
+// unrelated boundary: general chat + admin config commands, open to any
+// registered Telegram chat unless admin-only mode is active, exactly
+// mirroring WhatsApp's own behavior — this is what makes "Peter" the
+// same identity whether he messages from WhatsApp or Telegram.
 function authorized(chatId) {
   return environment.telegramAuthorizedChatIds.length === 0 || environment.telegramAuthorizedChatIds.includes(Number(chatId));
 }
@@ -77,7 +88,80 @@ async function beginPairing(bot, msg, rawNumber) {
 // so they aren't Telegram-only — see that file's header comment for why
 // authorization is resolved per-platform before being passed in here.
 
-const TELEGRAM_USER_EXTRA = ['/start — pairing help', '/connect <number> — pair WhatsApp', '/disconnect — unpair WhatsApp'];
+const TELEGRAM_USER_EXTRA = ['/start — pairing help', '/connect <number> — pair WhatsApp (restricted)', '/disconnect — unpair WhatsApp (restricted)', '/register <name> — register this chat'];
+
+function telegramJid(chatId) {
+  // A distinct, unambiguous prefix so a Telegram registration can never
+  // collide on the jid UNIQUE constraint with a real WhatsApp jid — the
+  // NAME collision (registered_name UNIQUE COLLATE NOCASE, no type
+  // filter) is what's SUPPOSED to happen across platforms (that's the
+  // whole point: "Peter" on WhatsApp blocks "Peter" on Telegram), this
+  // is only about the underlying jid identifier being unique per row.
+  return `tg:${chatId}`;
+}
+
+async function handleRegister(bot, msg, rawName) {
+  const chatId = msg.chat.id;
+  const name = String(rawName || '').trim();
+  if (!name) {
+    await bot.sendMessage(chatId, 'Use /register <name> to register this chat.');
+    return;
+  }
+  try {
+    const result = await sessionStore.register(telegramJid(chatId), 'telegram', name);
+    if (!result.ok) {
+      const reply = result.code === 'already_registered'
+        ? 'This chat is already registered.'
+        : result.code === 'name_taken'
+          ? `The name "${result.name}" is already in use (registered names are shared across WhatsApp and Telegram — pick a different one).`
+          : 'That name is not valid. Please pick another name.';
+      await bot.sendMessage(chatId, reply);
+      return;
+    }
+    sessionStore.recordParticipant(result.session.id, telegramJid(chatId), msg.from?.first_name || msg.from?.username || 'Telegram user');
+    await bot.sendMessage(chatId, `✅ Registered as "${result.session.registered_name}".\n\nYour chat session is ready.`);
+  } catch (error) {
+    console.error('[Telegram registration]', error?.message || error);
+    await bot.sendMessage(chatId, 'Registration could not be completed. Please try again.');
+  }
+}
+
+async function handleChat(bot, msg, text) {
+  const chatId = msg.chat.id;
+  const jid = telegramJid(chatId);
+  const session = sessionStore.getByJid(jid);
+
+  // Same three gates as WhatsApp, in the same order, for the same
+  // reasons — see whatsapp.js's handleIncomingMessage for the full
+  // reasoning on each: ban is total silence and checked first; admin-only
+  // silently ignores non-admins (including unregistered strangers, so
+  // registration itself is blocked too, consistent with WhatsApp); an
+  // unregistered chat gets pointed at /register.
+  if (sessionStore.isBanned(session)) return;
+
+  if (getAccessMode(sessionStore) === 'adminonly' && !(session && isAdminSession(session))) {
+    return;
+  }
+
+  if (!session) {
+    await bot.sendMessage(chatId, '👋 Before we can chat here, please register this chat.\n\nUse: /register <name>');
+    return;
+  }
+
+  const displayName = msg.from?.first_name || msg.from?.username || 'Telegram user';
+  sessionStore.recordParticipant(session.id, jid, displayName);
+  await sessionStore.appendChat(session, { role: 'user', content: text, senderJid: jid, senderName: displayName, at: new Date().toISOString() });
+
+  let reply;
+  try {
+    reply = await runYuki(session, text, jid, displayName, {});
+  } catch (error) {
+    console.error('[Yuki call failed - telegram]', error?.message || error);
+    await bot.sendMessage(chatId, `⚠️ Couldn't get a reply from the model: ${error?.message || 'unknown error'}`);
+    return;
+  }
+  await bot.sendMessage(chatId, markdownToTelegram(reply), { parse_mode: 'HTML' });
+}
 
 export async function handleTelegramMessage(bot, msg, callbackQueryId = null) {
   const chatId = msg.chat.id;
@@ -91,7 +175,11 @@ export async function handleTelegramMessage(bot, msg, callbackQueryId = null) {
     return;
   }
 
-  if (!text.startsWith('/')) return;
+  if (!text.startsWith('/')) {
+    if (text) await handleChat(bot, msg, text);
+    return;
+  }
+
   const [command, ...args] = text.split(/\s+/);
   const name = command.slice(1).toLowerCase();
   const rest = text.slice(command.length).trim();
@@ -101,6 +189,9 @@ export async function handleTelegramMessage(bot, msg, callbackQueryId = null) {
     return;
   }
 
+  // /connect and /disconnect stay restricted to YUKI_AUTHORIZED_CHAT_IDS
+  // — this is the ONE thing that stays gated; everything else below is
+  // open to any Telegram chat, same as WhatsApp.
   if (name === 'connect') {
     await beginPairing(bot, msg, args[0]);
     return;
@@ -111,6 +202,11 @@ export async function handleTelegramMessage(bot, msg, callbackQueryId = null) {
     return;
   }
 
+  if (name === 'register') {
+    await handleRegister(bot, msg, rest);
+    return;
+  }
+
   if (name === 'menu') {
     const isAuthorized = authorized(chatId);
     await bot.sendMessage(chatId, buildMenuText(isAuthorized, TELEGRAM_USER_EXTRA), { parse_mode: 'Markdown' });
@@ -118,7 +214,15 @@ export async function handleTelegramMessage(bot, msg, callbackQueryId = null) {
   }
 
   const reply = (t) => bot.sendMessage(chatId, t);
-  await dispatchAdminCommand(name, args, rest, reply, authorized(chatId), chatId);
+  const isAdmin = isAdminSession(sessionStore.getByJid(telegramJid(chatId)));
+  const handled = await dispatchAdminCommand(name, args, rest, reply, isAdmin, chatId);
+  if (handled) return;
+
+  // Not a recognized command and starts with '/' — could be a genuine
+  // typo, or just a message that happens to start with a slash. Treat it
+  // as chat rather than silently dropping it, same as WhatsApp falls
+  // through to the AI for an unrecognized command-prefixed message.
+  await handleChat(bot, msg, text);
 }
 
 export function handleTelegramError(error) {

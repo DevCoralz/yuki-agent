@@ -356,7 +356,7 @@ export async function executeTool(name, args, ctx) {
 
   if (name === 'run_command') {
     const commandInput = args.command_lines?.length ? args.command_lines : args.command;
-    return runTerminal(session.workspace_path, commandInput, { cwd: args.cwd });
+    return runTerminal(session.workspace_path, commandInput, { cwd: args.cwd, sessionId: session.id });
   }
 
   if (name === 'receive_file') {

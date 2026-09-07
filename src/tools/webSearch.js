@@ -1,4 +1,4 @@
-// Keyless web search, in two layers:
+// Keyless web search, in three layers:
 //
 // 1. DuckDuckGo Instant Answer API (api.duckduckgo.com) — official, free,
 //    no key, no published rate limit. But it only returns curated
@@ -6,20 +6,35 @@
 //    Most ordinary queries ("latest news about X", "how do I do Y") return
 //    nothing here — that's expected, not a bug.
 //
-// 2. DuckDuckGo HTML results page (html.duckduckgo.com/html/) — UNOFFICIAL,
-//    undocumented, no key. This is what actually returns real search
-//    results, used only as a fallback when step 1 comes back empty. It can
-//    break silently if DuckDuckGo changes their HTML markup (no changelog,
-//    no warning — you'll just start getting empty results), and heavy use
-//    from one IP risks a CAPTCHA/bot-block page instead of results.
-//    Community reports suggest this can trigger under ~30 requests/minute
-//    from a single IP — this is a shared box, so stay well under that.
+// 2. Wikipedia's official REST API (en.wikipedia.org/w/rest.php) — also
+//    official, free, no key, genuinely stable (not scraped HTML — a real
+//    documented JSON API). Added specifically because it's a much more
+//    reliable path for FACTUAL/definitional queries ("who is X", "what is
+//    Y", "when did Z happen") than the scraping fallback below, and covers
+//    exactly the case that was failing: asking for a fact and getting
+//    nothing back, because layer 1 has no article and layer 3 (below) had
+//    silently hit a bot-block page.
 //
-// If both layers come back empty, the tool returns a clear "no results"
-// object rather than throwing — a search miss is a normal outcome the
+// 3. DuckDuckGo HTML results page (html.duckduckgo.com/html/) — UNOFFICIAL,
+//    undocumented, no key. Broadest coverage (general search, not just
+//    facts/definitions), used as the last resort. This is confirmed
+//    fragile in practice, not just theoretically: DuckDuckGo can serve an
+//    anti-bot/CAPTCHA "anomaly" page instead of real results, especially
+//    from datacenter IPs (which a Fly.io box is) rather than residential
+//    ones — every serious independent implementation of this same scrape
+//    explicitly checks for that page and treats it as a distinct failure,
+//    not a plain empty result. This tool now does that check too — see
+//    isBlockedPage() — instead of silently reporting "no results" when the
+//    real cause was a bot-block page, which is exactly what was happening
+//    before and made a real block indistinguishable from a genuine miss.
+//
+// If all three layers come back empty, the tool returns a clear "no
+// results" object (with the REAL reason, e.g. "blocked" vs "genuinely no
+// matches") rather than throwing — a search miss is a normal outcome the
 // model should handle gracefully, not an error state.
 
 const INSTANT_ANSWER_URL = 'https://api.duckduckgo.com/';
+const WIKIPEDIA_SEARCH_URL = 'https://en.wikipedia.org/w/rest.php/v1/search/page';
 const HTML_SEARCH_URL = 'https://html.duckduckgo.com/html/';
 const FETCH_TIMEOUT_MS = 10000;
 const MAX_HTML_RESULTS = 5;
@@ -38,6 +53,19 @@ async function fetchWithTimeout(url, options = {}) {
   } finally {
     clearTimeout(timer);
   }
+}
+
+// DuckDuckGo serves this instead of real results when it thinks the
+// request is automated — confirmed against multiple independent
+// implementations of this exact scrape, all of which check for this
+// specifically rather than treating it as zero results. A blocked page
+// has none of the real result markup, so checking for its absence AND
+// these markers avoids ever mistaking "confirmed blocked" for "confirmed
+// no matches" — the two need different handling (retry later / note a
+// real key may be needed, vs. just telling the user nothing was found).
+function isBlockedPage(html) {
+  return /anomaly-modal|unusual traffic|detected unusual|bots use duckduckgo too/i.test(html)
+    && !/class="result__a"/.test(html);
 }
 
 async function tryInstantAnswer(query) {
@@ -130,6 +158,37 @@ function parseHtmlResults(html) {
   return results;
 }
 
+/**
+ * Wikipedia's official search REST API — a real documented JSON endpoint,
+ * not scraped HTML, so it doesn't share the CAPTCHA/markup-drift fragility
+ * of the HTML fallback below. Best for factual/definitional/biographical
+ * queries; won't help with current news, prices, or anything Wikipedia
+ * wouldn't have an article on — that's still what layer 3 is for.
+ */
+async function tryWikipedia(query) {
+  const url = `${WIKIPEDIA_SEARCH_URL}?q=${encodeURIComponent(query)}&limit=${MAX_HTML_RESULTS}`;
+  const response = await fetchWithTimeout(url, {
+    // Wikipedia's own REST API docs and etiquette expect a real
+    // identifying User-Agent here, not a browser-spoofed one (unlike the
+    // DuckDuckGo scrape below, where that's the whole point) — this is
+    // a legitimate, welcomed API client, not something trying to look
+    // like a browser.
+    headers: { 'User-Agent': 'YukiAgent/1.0 (WhatsApp assistant; keyless search fallback)', Accept: 'application/json' },
+  });
+  if (!response.ok) return null;
+
+  const data = await response.json();
+  const pages = data?.pages || [];
+  if (!pages.length) return null;
+
+  return pages.map(p => ({
+    title: p.title,
+    snippet: (p.excerpt || '').replace(/<[^>]+>/g, ''), // API wraps matched terms in <span>, strip for plain text
+    url: `https://en.wikipedia.org/wiki/${encodeURIComponent(p.key)}`,
+    source: 'Wikipedia',
+  }));
+}
+
 async function tryHtmlSearch(query) {
   const response = await fetchWithTimeout(HTML_SEARCH_URL, {
     method: 'POST',
@@ -139,51 +198,60 @@ async function tryHtmlSearch(query) {
     },
     body: `q=${encodeURIComponent(query)}`,
   });
-  if (!response.ok) return null;
+  if (!response.ok) return { results: null, blocked: false };
 
   const html = await response.text();
+  if (isBlockedPage(html)) return { results: null, blocked: true };
+
   const results = parseHtmlResults(html);
-  return results.length ? results : null;
+  return { results: results.length ? results : null, blocked: false };
 }
 
 /**
- * Searches the web for `query`. Tries the official Instant Answer API
- * first; falls back to the unofficial HTML results page only if that
- * comes back empty. Never throws on a search miss — returns
- * { results: [], note: '...' } instead, so the model can tell the user
- * plainly rather than the tool call erroring out.
+ * Searches the web for `query` across three keyless layers — DuckDuckGo
+ * Instant Answer (curated facts/definitions), Wikipedia (general facts,
+ * official API), DuckDuckGo HTML scrape (broadest, least reliable) — in
+ * that order, stopping at the first that returns something. Never throws
+ * on a search miss — returns { results: [], note: '...' } instead, so the
+ * model can tell the user plainly rather than the tool call erroring out.
+ * The note distinguishes a confirmed bot-block from a genuine "nothing
+ * found", since those need different framing to the user (retry later /
+ * a real API key may help, vs. this topic just isn't out there).
  */
 export async function webSearch(query) {
   const q = String(query || '').trim();
   if (!q) throw new Error('A search query is required.');
 
-  let results = null;
-  let usedFallback = false;
+  try {
+    const results = await tryInstantAnswer(q);
+    if (results) return { results, source: 'instant_answer' };
+  } catch {
+    // Instant Answer API being unreachable isn't fatal — fall through.
+  }
 
   try {
-    results = await tryInstantAnswer(q);
+    const results = await tryWikipedia(q);
+    if (results) return { results, source: 'wikipedia' };
   } catch {
-    // Instant Answer API being unreachable isn't fatal — fall through to HTML.
+    // Wikipedia being unreachable isn't fatal either — fall through to the scrape.
   }
 
-  if (!results) {
-    usedFallback = true;
-    try {
-      results = await tryHtmlSearch(q);
-    } catch (e) {
-      return {
-        results: [],
-        note: `Search failed: ${e?.message || 'unknown error'}. This uses a keyless, unofficial search path that can be temporarily blocked — if this keeps happening, a real search API key may be needed.`,
-      };
-    }
-  }
-
-  if (!results || !results.length) {
+  let blocked = false;
+  try {
+    const html = await tryHtmlSearch(q);
+    if (html.results) return { results: html.results, source: 'html_fallback' };
+    blocked = html.blocked;
+  } catch (e) {
     return {
       results: [],
-      note: 'No search results found for this query.',
+      note: `Search failed: ${e?.message || 'unknown error'}. This uses keyless search paths that can be temporarily unreachable — if this keeps happening, a real search API key may be needed.`,
     };
   }
 
-  return { results, source: usedFallback ? 'html_fallback' : 'instant_answer' };
+  return {
+    results: [],
+    note: blocked
+      ? 'The search backend returned a bot-block page instead of results (this happens sometimes on shared hosting IPs) — this is a temporary block, not confirmation that nothing exists for this query. Worth trying again shortly, or rephrasing.'
+      : 'No search results found for this query across all available sources.',
+  };
 }

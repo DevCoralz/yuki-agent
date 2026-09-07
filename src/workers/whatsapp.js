@@ -3,6 +3,7 @@ import makeWASocket, {
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
+  downloadContentFromMessage,
 } from '@whiskeysockets/baileys';
 import { Boom } from '@hapi/boom';
 import path from 'node:path';
@@ -44,16 +45,54 @@ function senderName(msg) {
  * and just logs the message to history (via the caller) without ever
  * calling the model — this is what keeps it quiet in group chatter until
  * someone actually talks to it.
+ *
+ * Reply-to-bot detection does NOT compare raw JID strings with
+ * startsWith. WhatsApp/Baileys addressing has two parallel schemes —
+ * plain phone-number JIDs (2348012345678@s.whatsapp.net) and LIDs
+ * (184729384756123@lid, an unrelated arbitrary number) — and accounts
+ * increasingly get migrated to LID addressing. If the bot's own
+ * identity (sock.user.id) and the replied-to message's participant
+ * field happen to be in different schemes, a naive
+ * `contextInfo.participant.startsWith(botNumber)` silently never
+ * matches, even for a genuine reply to the bot's own message — this is
+ * the exact same class of bug already root-caused and fixed once before
+ * in a sibling project (see bot-ecosystem memory: normalizeJidToNumber's
+ * LID detection bug). The fix there was to prefer Baileys' own
+ * message-key phone-number fields (senderPn/participantPn) over string
+ * derivation — applied the same way here via isSameWaUser(), which
+ * compares the numeric local-part of two JIDs regardless of which
+ * scheme each happens to be in, and only requires a real numeric match,
+ * not a specific domain suffix.
  */
 const YUKI_NAME_PATTERN = /\byuki\b/i;
 
+function jidLocalPart(jid) {
+  return String(jid || '').split('@')[0].split(':')[0];
+}
+
+/**
+ * True if two JIDs refer to the same WhatsApp account, tolerant of one
+ * being a LID (@lid) and the other a phone-number JID
+ * (@s.whatsapp.net) — a plain string comparison across those two
+ * schemes will never match even for the same real account, since a LID
+ * is an arbitrary unrelated number, not derived from the phone number.
+ */
+function isSameWaUser(jidA, jidB) {
+  if (!jidA || !jidB) return false;
+  return jidLocalPart(jidA) === jidLocalPart(jidB);
+}
+
 function isAddressedInGroup(sock, msg, text) {
-  const botNumber = sock.user?.id?.split(':')[0];
-  if (!botNumber) return false;
+  const botJid = sock.user?.id;
+  if (!botJid) return false;
 
   const contextInfo = msg.message?.extendedTextMessage?.contextInfo;
-  const mentioned = contextInfo?.mentionedJid?.some(j => j.startsWith(botNumber));
-  const isReplyToBot = contextInfo?.participant?.startsWith(botNumber);
+  // mentionedJid entries and contextInfo.participant can each
+  // independently be in either scheme (LID or phone-JID) depending on
+  // account migration state — isSameWaUser handles both without caring
+  // which one either side happens to use.
+  const mentioned = contextInfo?.mentionedJid?.some(j => isSameWaUser(j, botJid));
+  const isReplyToBot = isSameWaUser(contextInfo?.participant, botJid);
   const startsWithPrefix = text.startsWith(environment.commandPrefix);
   const saysYukiByName = YUKI_NAME_PATTERN.test(text);
 
@@ -72,6 +111,59 @@ async function withTyping(sock, jid, fn) {
   }
 }
 
+/**
+ * Sends a text (optionally with an attached image as the caption image)
+ * to every registered session's jid. Image detection follows the same
+ * pattern as receive_file/saveIncomingMedia in mediaTools.js — checks
+ * the /broadcast message itself for an attached imageMessage. Skips
+ * banned sessions (a ban should mean total silence, including broadcasts)
+ * and reports real success/failure counts rather than an unconditional
+ * "sent ✅", since a stale/invalid jid or a send error for one session
+ * shouldn't be hidden behind a blanket success claim.
+ */
+async function broadcastToAllSessions(sock, msg, caption) {
+  const text = String(caption || '').trim();
+  const imageMsg = msg.message?.imageMessage;
+  if (!text && !imageMsg) {
+    await sock.sendMessage(msg.key.remoteJid, { text: '❌ Usage: /broadcast <message> (optionally attach an image — its caption becomes this text).' });
+    return;
+  }
+
+  let imageBuffer = null;
+  if (imageMsg) {
+    try {
+      const stream = await downloadContentFromMessage(imageMsg, 'image');
+      const chunks = [];
+      for await (const chunk of stream) chunks.push(chunk);
+      imageBuffer = Buffer.concat(chunks);
+    } catch (error) {
+      await sock.sendMessage(msg.key.remoteJid, { text: `❌ Couldn't read the attached image: ${error?.message || 'unknown error'}. Sending as text only.` });
+    }
+  }
+
+  const sessions = sessionStore.listSessions().filter(s => !s.banned);
+  let sent = 0;
+  const failures = [];
+  for (const s of sessions) {
+    const full = sessionStore.getByName(s.registered_name);
+    if (!full?.jid) { failures.push(`${s.registered_name}: no jid on record`); continue; }
+    try {
+      if (imageBuffer) {
+        await sock.sendMessage(full.jid, { image: imageBuffer, caption: text || undefined });
+      } else {
+        await sock.sendMessage(full.jid, { text });
+      }
+      sent++;
+    } catch (error) {
+      failures.push(`${s.registered_name}: ${error?.message || 'send failed'}`);
+    }
+  }
+
+  const summary = `📢 Broadcast sent to ${sent}/${sessions.length} session${sessions.length === 1 ? '' : 's'}.` +
+    (failures.length ? `\n\nFailed:\n${failures.join('\n')}` : '');
+  await sock.sendMessage(msg.key.remoteJid, { text: summary });
+}
+
 async function handleIncomingMessage(msg) {
   if (msg.key.fromMe || !msg.key.remoteJid || msg.key.remoteJid === 'status@broadcast') return;
 
@@ -83,6 +175,12 @@ async function handleIncomingMessage(msg) {
   const participantJid = senderOf(msg);
   const displayName = senderName(msg);
   const session = sessionStore.getByJid(jid);
+
+  // Banned sessions get ZERO reply — not a refusal message, not
+  // anything — checked before every other gate (admin-only mode,
+  // registration flow, everything) since "won't even reply a dime" was
+  // explicit: any reply at all, even "you're banned", is still a reply.
+  if (sessionStore.isBanned(session)) return;
 
   // Admin-only mode: unregistered strangers AND any registered non-admin
   // session are silently ignored (no reply at all — an explicit refusal
@@ -160,6 +258,12 @@ async function handleIncomingMessage(msg) {
       return;
     }
 
+    if (cmdName === 'broadcast') {
+      if (!isAdmin) { await reply('This command is not enabled for this chat.'); return; }
+      await broadcastToAllSessions(this, msg, rest);
+      return;
+    }
+
     const handled = await dispatchAdminCommand(cmdName, args, rest, reply, isAdmin, participantJid);
     if (handled) return;
     // Not a recognized command (e.g. "/register" again, already handled
@@ -167,7 +271,7 @@ async function handleIncomingMessage(msg) {
     // same as any command-prefixed text always did.
   }
 
-  const botNumber = this.user?.id?.split(':')[0] || '';
+  const botNumber = jidLocalPart(this.user?.id);
   const cleanText = type === 'group' && botNumber
     ? text.replace(new RegExp(`@${botNumber}\\s*`, 'gi'), '').trim() || text
     : text;
