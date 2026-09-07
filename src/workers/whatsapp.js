@@ -12,8 +12,9 @@ import pino from 'pino';
 import { environment } from '../config/environment.js';
 import { sessionStore, detectChat } from '../storage/sessionStore.js';
 import { runYuki } from '../ai/yuki.js';
-import { isAdminSession, getAccessMode, getCtxLimitChars, getCtxResetHours } from '../config/adminConfig.js';
-import { buildMenuText, dispatchAdminCommand } from '../config/adminCommands.js';
+import { markdownToWhatsApp } from '../ai/whatsappFormat.js';
+import { isAdminSession, getAccessMode, getCtxLimitChars } from '../config/adminConfig.js';
+import { buildMenuText, dispatchAdminCommand, cmdCtx, cmdMyKey, cmdMyEndpoint, cmdMyModel } from '../config/adminCommands.js';
 
 const silentLogger = pino({ level: 'silent' });
 
@@ -254,7 +255,27 @@ async function handleIncomingMessage(msg) {
     const isAdmin = isAdminSession(session);
 
     if (cmdName === 'menu') {
-      await reply(buildMenuText(isAdmin));
+      await reply(markdownToWhatsApp(buildMenuText(isAdmin)));
+      return;
+    }
+
+    if (cmdName === 'ctx') {
+      await cmdCtx((t) => reply(markdownToWhatsApp(t)), session);
+      return;
+    }
+
+    if (cmdName === 'mykey') {
+      await cmdMyKey((t) => reply(markdownToWhatsApp(t)), session, rest);
+      return;
+    }
+
+    if (cmdName === 'myendpoint') {
+      await cmdMyEndpoint((t) => reply(markdownToWhatsApp(t)), session, rest);
+      return;
+    }
+
+    if (cmdName === 'mymodel') {
+      await cmdMyModel((t) => reply(markdownToWhatsApp(t)), session, rest);
       return;
     }
 
@@ -264,7 +285,7 @@ async function handleIncomingMessage(msg) {
       return;
     }
 
-    const handled = await dispatchAdminCommand(cmdName, args, rest, reply, isAdmin, participantJid);
+    const handled = await dispatchAdminCommand(cmdName, args, rest, (t) => reply(markdownToWhatsApp(t)), isAdmin, participantJid);
     if (handled) return;
     // Not a recognized command (e.g. "/register" again, already handled
     // above, or genuinely unknown) — fall through to the AI as before,
@@ -284,22 +305,13 @@ async function handleIncomingMessage(msg) {
   // what keeps it silent during normal group chatter.
   if (type === 'group' && !isAddressedInGroup(this, msg, text)) return;
 
-  // Per-user context quota — admin sessions (ADMIN_SESSIONS) bypass this
-  // entirely regardless of any /setctx value. No quota configured at all
-  // (getCtxLimitChars returns null) means unlimited for everyone, same as
-  // before this feature existed.
+  // Quota enforcement itself now lives INSIDE runYuki — being over quota
+  // no longer blocks the message entirely; the model still replies
+  // conversationally, just without tool access (see yuki.js). isAdmin/
+  // ctxLimit are still needed here only for the usage-recording call
+  // below, not for gating.
   const isAdmin = isAdminSession(session);
   const ctxLimit = getCtxLimitChars(sessionStore);
-  if (!isAdmin && ctxLimit) {
-    const resetHours = getCtxResetHours(sessionStore);
-    const usage = sessionStore.getCtxUsage(session.id, resetHours);
-    if (usage.charsUsed >= ctxLimit) {
-      await this.sendMessage(jid, {
-        text: `⏳ You've hit this chat's usage limit for now (resets every ${resetHours}h). Try again later.`,
-      }, { quoted: msg });
-      return;
-    }
-  }
 
   const toolCtx = { sock: this, jid, sourceMsg: msg };
   let reply;
@@ -330,7 +342,11 @@ async function handleIncomingMessage(msg) {
     // and the reply, since both cost real context either way.
     sessionStore.addCtxUsage(session.id, cleanText.length + reply.length);
   }
-  await this.sendMessage(jid, { text: reply }, { quoted: msg });
+  // runYuki now returns plain Markdown (platform formatting moved OUT of
+  // yuki.js so Telegram sessions don't get WhatsApp's dialect baked in
+  // before telegramHandler.js's own converter runs on top of it — that
+  // was a real double-conversion bug). Applied here, once, for WhatsApp.
+  await this.sendMessage(jid, { text: markdownToWhatsApp(reply) }, { quoted: msg });
 }
 
 export async function createWhatsAppSocket(phoneNumber, manager) {

@@ -150,6 +150,37 @@ export class SessionStore {
     if (!sessionColumns.includes('banned_by')) {
       this.db.exec('ALTER TABLE chat_sessions ADD COLUMN banned_by TEXT;');
     }
+    // own_api_key: the user's personal key, set via /mykey. NULL until
+    // set. own_key_allowed/public_key_allowed: independent per-user
+    // switches an admin can flip with /allowownkey, /disallowownkey,
+    // /allowpublickey, /disallowpublickey (or "all" for every session at
+    // once) — see resolveApiKeyForSession() in runtimeConfig.js for how
+    // the two combine into one actual decision. Both default to 1
+    // (allowed) so existing behavior (shared key works for everyone) is
+    // unchanged until an admin deliberately restricts someone.
+    if (!sessionColumns.includes('own_api_key')) {
+      this.db.exec('ALTER TABLE chat_sessions ADD COLUMN own_api_key TEXT;');
+    }
+    if (!sessionColumns.includes('own_key_allowed')) {
+      this.db.exec('ALTER TABLE chat_sessions ADD COLUMN own_key_allowed INTEGER NOT NULL DEFAULT 1;');
+    }
+    if (!sessionColumns.includes('public_key_allowed')) {
+      this.db.exec('ALTER TABLE chat_sessions ADD COLUMN public_key_allowed INTEGER NOT NULL DEFAULT 1;');
+    }
+    // own_base_url/own_model: a user bringing their own key is very
+    // possibly pointing at a DIFFERENT provider entirely (not just a
+    // different credential for this bot's existing shared endpoint) —
+    // e.g. their own OpenAI/Anthropic-compatible account, which almost
+    // certainly needs its own base URL and may need a different model
+    // name too. NULL means "use the shared base_url/model" (set via
+    // /myendpoint, /mymodel — independent of whether own_api_key is
+    // set, so a user can set these ahead of/without a key change).
+    if (!sessionColumns.includes('own_base_url')) {
+      this.db.exec('ALTER TABLE chat_sessions ADD COLUMN own_base_url TEXT;');
+    }
+    if (!sessionColumns.includes('own_model')) {
+      this.db.exec('ALTER TABLE chat_sessions ADD COLUMN own_model TEXT;');
+    }
   }
 
   /**
@@ -187,6 +218,92 @@ export class SessionStore {
 
   resetAllCtxUsage() {
     this.db.prepare('UPDATE ctx_usage SET chars_used = 0, window_started_at = CURRENT_TIMESTAMP').run();
+  }
+
+  /**
+   * Force-resets every ctx_usage row whose window has aged past
+   * resetHours, REGARDLESS of whether that session has sent a message
+   * recently. getCtxUsage() above only resets lazily — the next time
+   * THAT SPECIFIC session happens to be checked — which does not satisfy
+   * "reset every six hours even when not used": a session that goes
+   * quiet for a week would just sit at its last usage number forever,
+   * never actually reset, since nothing re-checks it. This is the
+   * counterpart called on a real timer (see app.js) rather than only
+   * from the per-message path. Skips admin sessions implicitly by simply
+   * never being consulted for them — getCtxLimitChars/isAdminSession
+   * already bypass quota checks for admins everywhere else, and this
+   * function only touches ctx_usage rows that exist at all, which are
+   * only ever created for non-admin sessions being checked in the first
+   * place (admins never call getCtxUsage since the quota check is
+   * skipped before it). Returns how many rows were actually reset, for
+   * logging/diagnostics.
+   */
+  forceResetExpiredCtxWindows(resetHours) {
+    const cutoffMs = resetHours * 60 * 60 * 1000;
+    const rows = this.db.prepare('SELECT session_id, window_started_at FROM ctx_usage').all();
+    let resetCount = 0;
+    for (const row of rows) {
+      const ageMs = Date.now() - new Date(row.window_started_at + 'Z').getTime();
+      if (ageMs > cutoffMs) {
+        this.db.prepare('UPDATE ctx_usage SET chars_used = 0, window_started_at = CURRENT_TIMESTAMP WHERE session_id = ?').run(row.session_id);
+        resetCount++;
+      }
+    }
+    return resetCount;
+  }
+
+  /**
+   * Per-user API key + the two independent admin-controlled permission
+   * switches (own_key_allowed, public_key_allowed). See
+   * resolveApiKeyForSession() in runtimeConfig.js for how these combine
+   * into one actual key-selection decision — this class only stores the
+   * raw values, it doesn't decide anything.
+   */
+  setOwnApiKey(sessionId, key) {
+    this.db.prepare('UPDATE chat_sessions SET own_api_key = ? WHERE id = ?').run(key, sessionId);
+  }
+
+  clearOwnApiKey(sessionId) {
+    this.db.prepare('UPDATE chat_sessions SET own_api_key = NULL WHERE id = ?').run(sessionId);
+  }
+
+  setOwnKeyAllowed(sessionId, allowed) {
+    this.db.prepare('UPDATE chat_sessions SET own_key_allowed = ? WHERE id = ?').run(allowed ? 1 : 0, sessionId);
+  }
+
+  setOwnKeyAllowedForAll(allowed) {
+    this.db.prepare('UPDATE chat_sessions SET own_key_allowed = ?').run(allowed ? 1 : 0);
+  }
+
+  setPublicKeyAllowed(sessionId, allowed) {
+    this.db.prepare('UPDATE chat_sessions SET public_key_allowed = ? WHERE id = ?').run(allowed ? 1 : 0, sessionId);
+  }
+
+  setPublicKeyAllowedForAll(allowed) {
+    this.db.prepare('UPDATE chat_sessions SET public_key_allowed = ?').run(allowed ? 1 : 0);
+  }
+
+  /**
+   * Per-user base URL / model overrides — independent of own_api_key
+   * (a user might set their own endpoint/model before ever setting a
+   * key, or vice versa). NULL means "use whatever the shared/global
+   * config resolves to" (see resolveApiBaseUrlForSession/
+   * resolveApiModelForSession in runtimeConfig.js).
+   */
+  setOwnBaseUrl(sessionId, url) {
+    this.db.prepare('UPDATE chat_sessions SET own_base_url = ? WHERE id = ?').run(url, sessionId);
+  }
+
+  clearOwnBaseUrl(sessionId) {
+    this.db.prepare('UPDATE chat_sessions SET own_base_url = NULL WHERE id = ?').run(sessionId);
+  }
+
+  setOwnModel(sessionId, model) {
+    this.db.prepare('UPDATE chat_sessions SET own_model = ? WHERE id = ?').run(model, sessionId);
+  }
+
+  clearOwnModel(sessionId) {
+    this.db.prepare('UPDATE chat_sessions SET own_model = NULL WHERE id = ?').run(sessionId);
   }
 
   /**

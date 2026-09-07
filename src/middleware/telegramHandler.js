@@ -1,9 +1,9 @@
 import { environment } from '../config/environment.js';
 import { sessionManager } from '../workers/sessionManager.js';
 import { formatPairingCode, validatePhoneNumber } from '../utils/phone.js';
-import { buildMenuText, dispatchAdminCommand } from '../config/adminCommands.js';
+import { buildMenuText, dispatchAdminCommand, cmdCtx, cmdMyKey, cmdMyEndpoint, cmdMyModel } from '../config/adminCommands.js';
 import { sessionStore } from '../storage/sessionStore.js';
-import { isAdminSession, getAccessMode } from '../config/adminConfig.js';
+import { isAdminSession, getAccessMode, getCtxLimitChars } from '../config/adminConfig.js';
 import { runYuki } from '../ai/yuki.js';
 import { markdownToTelegram } from '../ai/telegramFormat.js';
 
@@ -100,6 +100,28 @@ function telegramJid(chatId) {
   return `tg:${chatId}`;
 }
 
+/**
+ * Telegram's typing indicator (sendChatAction 'typing') self-clears
+ * after ~5 seconds — Telegram's own docs are explicit about this — so a
+ * single call before a potentially-long runYuki() call would show
+ * "typing..." for a few seconds and then silently stop while the model
+ * is still actually working. Mirrors WhatsApp's withTyping in this same
+ * codebase: re-sends every 4.5s (just under the 5s expiry) for as long
+ * as fn() is running, then lets it lapse naturally once done (no
+ * explicit "stopped typing" action exists on Telegram's side the way
+ * WhatsApp has 'paused' — it just times out on its own).
+ */
+async function withTypingTelegram(bot, chatId, fn) {
+  let timer;
+  try {
+    await bot.sendChatAction(chatId, 'typing').catch(() => {});
+    timer = setInterval(() => bot.sendChatAction(chatId, 'typing').catch(() => {}), 4500);
+    return await fn();
+  } finally {
+    clearInterval(timer);
+  }
+}
+
 async function handleRegister(bot, msg, rawName) {
   const chatId = msg.chat.id;
   const name = String(rawName || '').trim();
@@ -154,11 +176,15 @@ async function handleChat(bot, msg, text) {
 
   let reply;
   try {
-    reply = await runYuki(session, text, jid, displayName, {});
+    reply = await withTypingTelegram(bot, chatId, () => runYuki(session, text, jid, displayName, {}));
   } catch (error) {
     console.error('[Yuki call failed - telegram]', error?.message || error);
     await bot.sendMessage(chatId, `⚠️ Couldn't get a reply from the model: ${error?.message || 'unknown error'}`);
     return;
+  }
+  if (!isAdminSession(session)) {
+    const ctxLimit = getCtxLimitChars(sessionStore);
+    if (ctxLimit) sessionStore.addCtxUsage(session.id, text.length + reply.length);
   }
   await bot.sendMessage(chatId, markdownToTelegram(reply), { parse_mode: 'HTML' });
 }
@@ -207,14 +233,36 @@ export async function handleTelegramMessage(bot, msg, callbackQueryId = null) {
     return;
   }
 
+  const session = sessionStore.getByJid(telegramJid(chatId));
+
   if (name === 'menu') {
     const isAuthorized = authorized(chatId);
-    await bot.sendMessage(chatId, buildMenuText(isAuthorized, TELEGRAM_USER_EXTRA), { parse_mode: 'Markdown' });
+    await bot.sendMessage(chatId, markdownToTelegram(buildMenuText(isAuthorized, TELEGRAM_USER_EXTRA)), { parse_mode: 'HTML' });
     return;
   }
 
-  const reply = (t) => bot.sendMessage(chatId, t);
-  const isAdmin = isAdminSession(sessionStore.getByJid(telegramJid(chatId)));
+  if (name === 'ctx') {
+    await cmdCtx((t) => bot.sendMessage(chatId, markdownToTelegram(t), { parse_mode: 'HTML' }), session);
+    return;
+  }
+
+  if (name === 'mykey') {
+    await cmdMyKey((t) => bot.sendMessage(chatId, markdownToTelegram(t), { parse_mode: 'HTML' }), session, rest);
+    return;
+  }
+
+  if (name === 'myendpoint') {
+    await cmdMyEndpoint((t) => bot.sendMessage(chatId, markdownToTelegram(t), { parse_mode: 'HTML' }), session, rest);
+    return;
+  }
+
+  if (name === 'mymodel') {
+    await cmdMyModel((t) => bot.sendMessage(chatId, markdownToTelegram(t), { parse_mode: 'HTML' }), session, rest);
+    return;
+  }
+
+  const reply = (t) => bot.sendMessage(chatId, markdownToTelegram(t), { parse_mode: 'HTML' });
+  const isAdmin = isAdminSession(session);
   const handled = await dispatchAdminCommand(name, args, rest, reply, isAdmin, chatId);
   if (handled) return;
 

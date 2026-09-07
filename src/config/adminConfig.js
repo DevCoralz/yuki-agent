@@ -37,8 +37,9 @@ export function setAccessMode(sessionStore, mode, updatedByJid) {
 
 export function getCtxLimitChars(sessionStore) {
   const raw = sessionStore.getRuntimeConfig(KEYS.ctxLimit);
+  if (raw === null) return 400000; // default per-user daily quota, in characters, until an admin changes it with /setctx
   const n = Number.parseInt(raw, 10);
-  return Number.isFinite(n) && n > 0 ? n : null; // null = no quota configured, i.e. unlimited
+  return Number.isFinite(n) && n > 0 ? n : null; // explicitly set to 0/blank via /setctx = unlimited
 }
 
 export function setCtxLimitChars(sessionStore, chars, updatedByJid) {
@@ -48,7 +49,7 @@ export function setCtxLimitChars(sessionStore, chars, updatedByJid) {
 export function getCtxResetHours(sessionStore) {
   const raw = sessionStore.getRuntimeConfig(KEYS.ctxResetHours);
   const n = Number.parseInt(raw, 10);
-  return Number.isFinite(n) && n > 0 ? n : 4; // default: 4-hour rolling window, matching the existing chat-quota pattern from an earlier build in this lineage
+  return Number.isFinite(n) && n > 0 ? n : 6; // default: 6-hour rolling window, per spec
 }
 
 export function setCtxResetHours(sessionStore, hours, updatedByJid) {
