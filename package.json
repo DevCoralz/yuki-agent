@@ -7,7 +7,8 @@
   "main": "src/app.js",
   "scripts": {
     "start": "node src/app.js",
-    "smoke": "node scripts/smoke-test.js"
+    "smoke": "node scripts/smoke-test.js",
+    "predeploy": "node scripts/pre-deploy-check.js"
   },
   "engines": { "node": ">=22.5.0" },
   "dependencies": {
