@@ -1,28 +1,8 @@
 import 'dotenv/config';
-import fs from 'node:fs/promises';
-import path from 'node:path';
 import { initializeTelegramBot, getBotInstance } from './workers/telegram.js';
 import { sessionManager, setNotifier } from './workers/sessionManager.js';
 import { sessionStore } from './storage/sessionStore.js';
 import { getCtxResetHours } from './config/adminConfig.js';
-
-// Startup guard: verify the persistent volume is mounted
-async function checkVolume() {
-  const dataDir = process.env.YUKI_WORKSPACE_ROOT || '/data/sessions';
-  try {
-    await fs.access(path.dirname(dataDir));
-    console.log(`[guard] Volume mounted OK at ${path.dirname(dataDir)}`);
-  } catch {
-    console.error(`\n[guard] FATAL: Persistent volume not mounted at ${path.dirname(dataDir)}`);
-    console.error('[guard] Data will be lost on every restart!');
-    console.error('[guard] Create the Fly volume first:');
-    console.error('[guard]   fly volumes create session_data --size 3 --region iad');
-    console.error('[guard] Then redeploy: fly deploy\n');
-    // Don't exit — allow startup so the user can still see the error in logs
-  }
-}
-checkVolume().catch(() => {});
-
 
 // Real, activity-independent reset sweep — runs on a timer, not just
 // lazily on a session's own next message. Without this, a session that

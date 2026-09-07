@@ -70,7 +70,7 @@ primary_region = "iad"   # must match the volume's region
   destination = "/data"
 
 [processes]
-  app = "sh -c /app/scripts/startup-guard.sh && node src/app.js"
+  app = "node src/app.js"
 
 # No [http_service] / [[services]] block — see the note at the top of
 # this file for why that's intentional, not an oversight.
