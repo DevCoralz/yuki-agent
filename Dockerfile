@@ -16,49 +16,6 @@
 # stopgap version bump.
 FROM node:22-slim
 
-# --- Dev + defensive-security toolchain -------------------------------
-# Baked into the image (not installed at runtime via run_command) so it
-# survives restarts/redeploys and doesn't cost boot time or need network
-# access on every cold start. Scope, by explicit choice:
-#   - full-stack dev: compilers, Python, common languages, git, build
-#     tools, ffmpeg, image libs, DB clients, curl/wget/jq (git clone and
-#     arbitrary downloads both already work via these + run_command)
-#   - deploy/infra tooling: wrangler (Cloudflare Workers/Pages CLI —
-#     deploy, publish, manage from chat) and cloudflared (tunnels)
-#   - defensive/analysis security tooling: nmap (for scanning YOUR OWN
-#     infra), openssl, hashing utilities, dependency-vulnerability
-#     scanners (npm audit is built into npm; pip-audit added below)
-# Deliberately EXCLUDED: exploit frameworks, credential-dumping tools,
-# and offensive scanners aimed at third-party targets (metasploit,
-# sqlmap, hydra, etc.) — this bot accepts commands from anyone who can
-# register a Telegram/WhatsApp chat, and run_command already has
-# unrestricted shell access within its workspace (see commandScreen.js).
-# Baking attacker tooling into that combination is a real risk, not a
-# hypothetical one, regardless of the operator's own intentions.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    # --- core build & VCS ---
-    build-essential git curl wget jq unzip zip ca-certificates gnupg \
-    # --- Python ---
-    python3 python3-pip python3-venv \
-    # --- media / image processing (also backs the image-analysis tool) ---
-    ffmpeg libvips-dev \
-    # --- networking / inspection (defensive use: your own infra only) ---
-    nmap netcat-openbsd dnsutils iputils-ping traceroute whois \
-    # --- crypto / hashing ---
-    openssl \
-    # --- DB clients ---
-    postgresql-client sqlite3 default-mysql-client \
-    # --- misc useful CLI ---
-    less vim-tiny \
-    && rm -rf /var/lib/apt/lists/* \
-    && pip3 install --break-system-packages --no-cache-dir pip-audit \
-    && npm install -g pnpm yarn typescript tsx wrangler \
-    && curl -L --output /tmp/cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb \
-    && dpkg -i /tmp/cloudflared.deb \
-    && rm -f /tmp/cloudflared.deb \
-    && echo "--- toolchain installed ---" \
-    && node --version && python3 --version && git --version && ffmpeg -version | head -1 && wrangler --version && cloudflared --version
-
 WORKDIR /app
 
 COPY package*.json ./
