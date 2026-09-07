@@ -1,5 +1,9 @@
-import { runTerminal } from './terminal.js';
-import { saveIncomingMedia, sendWorkspaceFile } from './mediaTools.js';
+import { runTerminal, killBackgroundJobs, hasBackgroundJobs } from './terminal.js';
+import {
+  saveIncomingMediaWhatsApp, sendWorkspaceFileWhatsApp,
+  saveIncomingMediaTelegram, sendWorkspaceFileTelegram,
+} from './mediaTools.js';
+import { analyzeImage } from './imageTools.js';
 import { webSearch } from './webSearch.js';
 import { listFiles, readFile, writeFile, editFile, deletePath, movePath, searchCode } from './fileTools.js';
 import { tagUsers } from './tagTools.js';
@@ -148,7 +152,7 @@ export const tools = [
     function: {
       name: 'run_command',
       description:
-        'Run a shell command inside this chat\'s private workspace. Full shell access: install packages, write and run code in any language, use ffmpeg on files already in the workspace, inspect or transform files, etc. Never reveal raw tool calls or commands to the user — describe results in plain language.',
+        'Run a shell command inside this chat\'s private workspace. Full shell access: install packages (npm/pip/apt-level tools already present), write and run code in any language, clone or pull from GitHub (git is preinstalled), download files (curl/wget), use ffmpeg on files already in the workspace, deploy to Cloudflare Workers/Pages (wrangler is preinstalled — will need the user\'s own Cloudflare API token/login the first time), open a Cloudflare Tunnel (cloudflared is preinstalled), run defensive security checks on infrastructure the user actually owns (nmap, openssl, pip-audit, npm audit), inspect or transform files, etc. Never reveal raw tool calls or commands to the user — describe results in plain language.',
       parameters: {
         type: 'object',
         properties: {
@@ -176,9 +180,22 @@ export const tools = [
   {
     type: 'function',
     function: {
+      name: 'stop_background_jobs',
+      description:
+        'Kill any background job(s) still running for this session (something started with run_command that was backgrounded with & — a server, a loop, a long-running script). Call this ONLY when the user is actually asking to stop/cancel/abort something that is currently running — judge real intent from context, not the literal word "stop" appearing anywhere in their message. "stop by the store later", "don\'t stop until it works", or the word "stop" inside a sentence about something else are NOT this — do not call this tool for those. Only call it when they clearly mean: halt the thing that\'s running right now.',
+      parameters: {
+        type: 'object',
+        properties: {},
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'receive_file',
       description:
-        'Download the media (image, video, audio, document, sticker) attached to the user\'s most recent message, or to the message they replied to, into the workspace so it can be inspected or processed with run_command. Call this before trying to operate on a file the user just sent.',
+        'Download the media (image, video, audio, document, sticker) attached to the user\'s most recent message, or to the message they replied to, into the workspace so it can be inspected or processed with run_command or analyze_image. Works on both WhatsApp and Telegram. Call this before trying to operate on a file the user just sent.',
       parameters: {
         type: 'object',
         properties: {
@@ -202,6 +219,22 @@ export const tools = [
         properties: {
           path: { type: 'string', description: 'Path to the file, relative to the session workspace root.' },
           caption: { type: 'string', description: 'Optional caption to send with the file.' },
+        },
+        required: ['path'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'analyze_image',
+      description:
+        'Analyze an image already in the workspace (download it first with receive_file if it just came from the user). Since the model itself cannot see images directly, this extracts real, measured data from the actual pixels: dimensions, format, file size, EXIF/color-space info, the average color, and a dominant-color palette (each color as a hex code plus its approximate share of the image). Use this whenever asked to describe an image\'s look, identify or replicate its colors, build a matching palette/gradient/CSS theme from it, or judge whether it\'s grayscale/black-and-white. This does NOT identify objects, faces, or text in the image — only color and geometry.',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'Path to the image file, relative to the session workspace root.' },
         },
         required: ['path'],
         additionalProperties: false,
@@ -359,14 +392,42 @@ export async function executeTool(name, args, ctx) {
     return runTerminal(session.workspace_path, commandInput, { cwd: args.cwd, sessionId: session.id });
   }
 
+  if (name === 'stop_background_jobs') {
+    const wasRunning = hasBackgroundJobs(session.id);
+    const { killed, alreadyDead } = killBackgroundJobs(session.id);
+    return {
+      ok: true,
+      was_running: wasRunning,
+      killed,
+      already_dead: alreadyDead,
+      note: killed > 0
+        ? `Killed ${killed} running background job${killed === 1 ? '' : 's'}.`
+        : 'Nothing was actually running in the background right now.',
+    };
+  }
+
   if (name === 'receive_file') {
     if (!ctx.sourceMsg) throw new Error('No message with media is available to download.');
-    return saveIncomingMedia(session.workspace_path, ctx.sourceMsg, args.file_name);
+    // Platform is picked by which context the caller wired in: Telegram
+    // passes ctx.bot (a node-telegram-bot-api instance), WhatsApp passes
+    // ctx.sock (a Baileys socket) — see telegramHandler.js / whatsapp.js
+    // for where toolCtx is built per platform.
+    return ctx.bot
+      ? saveIncomingMediaTelegram(ctx.bot, session.workspace_path, ctx.sourceMsg, args.file_name)
+      : saveIncomingMediaWhatsApp(session.workspace_path, ctx.sourceMsg, args.file_name);
   }
 
   if (name === 'send_file') {
+    if (ctx.bot) {
+      if (!ctx.chatId) throw new Error('No active chat to send the file to.');
+      return sendWorkspaceFileTelegram(ctx.bot, ctx.chatId, session.workspace_path, args.path, args.caption);
+    }
     if (!ctx.sock || !ctx.jid) throw new Error('No active chat to send the file to.');
-    return sendWorkspaceFile(ctx.sock, ctx.jid, session.workspace_path, args.path, args.caption);
+    return sendWorkspaceFileWhatsApp(ctx.sock, ctx.jid, session.workspace_path, args.path, args.caption);
+  }
+
+  if (name === 'analyze_image') {
+    return analyzeImage(session.workspace_path, args.path);
   }
 
   if (name === 'tag_users') {

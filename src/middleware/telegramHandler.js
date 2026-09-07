@@ -6,6 +6,7 @@ import { sessionStore } from '../storage/sessionStore.js';
 import { isAdminSession, getAccessMode, getCtxLimitChars } from '../config/adminConfig.js';
 import { runYuki } from '../ai/yuki.js';
 import { markdownToTelegram } from '../ai/telegramFormat.js';
+import { telegramMessageHasMedia } from '../tools/mediaTools.js';
 
 // WhatsApp pairing (/connect, /disconnect) stays restricted to
 // YUKI_AUTHORIZED_CHAT_IDS — this is the "only allowed chat id can pair
@@ -148,6 +149,29 @@ async function handleRegister(bot, msg, rawName) {
   }
 }
 
+// When a photo/document/video/etc. arrives with NO caption, the user
+// gave no instruction at all — there's nothing for a plain "text" turn
+// to contain. Rather than silently ignoring it, this synthesizes the
+// user turn so the model gets a concrete, consistent instruction:
+// download it, actually inspect it (analyze_image for images — real
+// pixel/color/format data, not a guess), then report findings and ask
+// what to do, BEFORE taking any further action. Written as an
+// instruction to Yuki, not as if the user said it, so it can't be
+// confused with something the user actually typed if it ever shows up
+// in chat history.
+function captionlessMediaInstruction(msg) {
+  const kind = Array.isArray(msg.photo) ? 'photo'
+    : msg.document ? 'document'
+    : msg.video ? 'video'
+    : msg.voice ? 'voice message'
+    : msg.audio ? 'audio file'
+    : msg.video_note ? 'video note'
+    : msg.sticker ? 'sticker'
+    : 'file';
+
+  return `[The user just sent a ${kind} with no caption or instruction attached.]\n\nUse receive_file to download it, then run_command/analyze_image to actually inspect it (use analyze_image for images — real dimensions, format, and color data, not a guess). Then tell the user plainly what you found — what it is, key details, and for an image its dimensions and dominant colors — and ask what they'd like done with it, or whether there's anything to change or add, before taking any further action. Don't guess at what they want; wait for their answer.`;
+}
+
 async function handleChat(bot, msg, text) {
   const chatId = msg.chat.id;
   const jid = telegramJid(chatId);
@@ -172,11 +196,28 @@ async function handleChat(bot, msg, text) {
 
   const displayName = msg.from?.first_name || msg.from?.username || 'Telegram user';
   sessionStore.recordParticipant(session.id, jid, displayName);
-  await sessionStore.appendChat(session, { role: 'user', content: text, senderJid: jid, senderName: displayName, at: new Date().toISOString() });
+
+  const hasMedia = telegramMessageHasMedia(msg);
+  const effectiveText = text || (hasMedia ? captionlessMediaInstruction(msg) : '');
+  if (!effectiveText) return; // nothing to log or send to the model
+
+  // Logged as what the user actually sent (the real caption, or a plain
+  // placeholder for media with none) — the synthesized instruction above
+  // is only what goes to the MODEL this turn, never written into chat
+  // history as if the user said it.
+  await sessionStore.appendChat(session, {
+    role: 'user',
+    content: text || (hasMedia ? '[media, no caption]' : ''),
+    senderJid: jid,
+    senderName: displayName,
+    at: new Date().toISOString(),
+  });
+
+  const toolCtx = { bot, chatId, sourceMsg: hasMedia ? msg : null };
 
   let reply;
   try {
-    reply = await withTypingTelegram(bot, chatId, () => runYuki(session, text, jid, displayName, {}));
+    reply = await withTypingTelegram(bot, chatId, () => runYuki(session, effectiveText, jid, displayName, toolCtx));
   } catch (error) {
     console.error('[Yuki call failed - telegram]', error?.message || error);
     await bot.sendMessage(chatId, `⚠️ Couldn't get a reply from the model: ${error?.message || 'unknown error'}`);
@@ -184,7 +225,7 @@ async function handleChat(bot, msg, text) {
   }
   if (!isAdminSession(session)) {
     const ctxLimit = getCtxLimitChars(sessionStore);
-    if (ctxLimit) sessionStore.addCtxUsage(session.id, text.length + reply.length);
+    if (ctxLimit) sessionStore.addCtxUsage(session.id, effectiveText.length + reply.length);
   }
   await bot.sendMessage(chatId, markdownToTelegram(reply), { parse_mode: 'HTML' });
 }
@@ -195,14 +236,19 @@ export async function handleTelegramMessage(bot, msg, callbackQueryId = null) {
     await bot.answerCallbackQuery(callbackQueryId).catch(() => {});
   }
 
-  const text = String(msg.text || '').trim();
+  const text = String(msg.text || msg.caption || '').trim();
   if (text === 'pair_device') {
     await bot.sendMessage(chatId, '📱 Send your WhatsApp number with country code:\n\n/connect 234xxxxxxxxx');
     return;
   }
 
+  // Photos/documents/etc. never start with '/' via msg.text (Telegram
+  // puts a caption, if any, in msg.caption, not msg.text) — route them
+  // to handleChat same as ordinary text, so captioned media works like
+  // a normal instruction and captionless media triggers the auto-detect
+  // + analyze + ask flow inside handleChat.
   if (!text.startsWith('/')) {
-    if (text) await handleChat(bot, msg, text);
+    if (text || telegramMessageHasMedia(msg)) await handleChat(bot, msg, text);
     return;
   }
 
