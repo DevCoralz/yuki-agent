@@ -15,7 +15,6 @@ import { runYuki } from '../ai/yuki.js';
 import { markdownToWhatsApp } from '../ai/whatsappFormat.js';
 import { isAdminSession, getAccessMode, getCtxLimitChars } from '../config/adminConfig.js';
 import { buildMenuText, dispatchAdminCommand, cmdCtx, cmdMyKey, cmdMyEndpoint, cmdMyModel } from '../config/adminCommands.js';
-import { whatsappMessageHasMedia } from '../tools/mediaTools.js';
 
 const silentLogger = pino({ level: 'silent' });
 
@@ -33,24 +32,6 @@ function messageText(message) {
 
 function senderOf(msg) {
   return msg.key.participant || msg.key.remoteJid;
-}
-
-// Same rationale as Telegram's captionlessMediaInstruction in
-// telegramHandler.js: a photo/document/etc. with no caption carries no
-// actual instruction, so rather than silently dropping it (the previous
-// behavior — see the `if (!text) return` guard this feeds into), this
-// tells Yuki explicitly to download it, actually inspect it, then report
-// and ask before doing anything further. Never written into chat history
-// as if the user said it — only used as this turn's message to the model.
-function captionlessMediaInstruction(message) {
-  const kind = message?.imageMessage ? 'photo'
-    : message?.documentMessage ? 'document'
-    : message?.videoMessage ? 'video'
-    : message?.audioMessage ? 'audio/voice message'
-    : message?.stickerMessage ? 'sticker'
-    : 'file';
-
-  return `[The user just sent a ${kind} with no caption or instruction attached.]\n\nUse receive_file to download it, then run_command/analyze_image to actually inspect it (use analyze_image for images — real dimensions, format, and color data, not a guess). Then tell the user plainly what you found — what it is, key details, and for an image its dimensions and dominant colors — and ask what they'd like done with it, or whether there's anything to change or add, before taking any further action. Don't guess at what they want; wait for their answer.`;
 }
 
 function senderName(msg) {
@@ -134,7 +115,7 @@ async function withTyping(sock, jid, fn) {
 /**
  * Sends a text (optionally with an attached image as the caption image)
  * to every registered session's jid. Image detection follows the same
- * pattern as receive_file/saveIncomingMediaWhatsApp in mediaTools.js — checks
+ * pattern as receive_file/saveIncomingMedia in mediaTools.js — checks
  * the /broadcast message itself for an attached imageMessage. Skips
  * banned sessions (a ban should mean total silence, including broadcasts)
  * and reports real success/failure counts rather than an unconditional
@@ -190,8 +171,7 @@ async function handleIncomingMessage(msg) {
   const jid = msg.key.remoteJid;
   const type = detectChat(jid);
   const text = String(messageText(msg.message)).trim();
-  const hasMedia = whatsappMessageHasMedia(msg);
-  if (!text && !hasMedia) return;
+  if (!text) return;
 
   const participantJid = senderOf(msg);
   const displayName = senderName(msg);
@@ -318,27 +298,12 @@ async function handleIncomingMessage(msg) {
     : text;
 
   sessionStore.recordParticipant(session.id, participantJid, displayName);
-  // Logged as what the user actually sent (real text, or a plain
-  // placeholder for captionless media) — the synthesized instruction
-  // built below is only what goes to the MODEL this turn, never written
-  // into chat history as if the user said it.
-  await sessionStore.appendChat(session, {
-    role: 'user',
-    content: cleanText || (hasMedia ? '[media, no caption]' : ''),
-    senderJid: participantJid,
-    senderName: displayName,
-    at: new Date().toISOString(),
-  });
+  await sessionStore.appendChat(session, { role: 'user', content: cleanText, senderJid: participantJid, senderName: displayName, at: new Date().toISOString() });
 
   // Group chats: message is now logged to history either way, but the
   // model is only invoked when the bot is actually addressed — this is
-  // what keeps it silent during normal group chatter. Captionless media
-  // in a group still needs an explicit address (mention/reply/prefix)
-  // same as text would — isAddressedInGroup handles that check already.
+  // what keeps it silent during normal group chatter.
   if (type === 'group' && !isAddressedInGroup(this, msg, text)) return;
-
-  const effectiveText = cleanText || (hasMedia ? captionlessMediaInstruction(msg.message) : '');
-  if (!effectiveText) return;
 
   // Quota enforcement itself now lives INSIDE runYuki — being over quota
   // no longer blocks the message entirely; the model still replies
@@ -353,7 +318,7 @@ async function handleIncomingMessage(msg) {
   try {
     reply = await withTyping(this, jid, () => runYuki(
       session,
-      effectiveText,
+      cleanText,
       participantJid,
       displayName,
       toolCtx,

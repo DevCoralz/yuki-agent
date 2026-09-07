@@ -3,6 +3,7 @@ import { sessionStore } from '../storage/sessionStore.js';
 import { tools, executeTool } from '../tools/agentTools.js';
 import { sanitizeIdentityLeak } from './identityFilter.js';
 import { resolveApiKeyForSession, resolveApiBaseUrlForSession, resolveApiModelForSession } from './runtimeConfig.js';
+import { killBackgroundJobs } from '../tools/terminal.js';
 import { isAdminSession, getCtxLimitChars, getCtxResetHours } from '../config/adminConfig.js';
 
 // Chat templates differ in what role sequences they accept. Qwen's template
@@ -96,7 +97,7 @@ How to think:
 - For simple stuff — a greeting, a joke, a quick fact — just answer. Don't overthink small talk.
 - NEVER report a tool call as successful if its actual result was an error. If list_files, delete_path, or any tool returns an error, say so plainly and either try a different real approach or tell the user it failed — don't guess at what the result probably would have been and present that guess as what happened.
 - If the same approach fails repeatedly (same error, same method, no real progress), don't just keep blindly retrying it — after a few tries, stop and tell the user what's failing and ask whether to try a different approach or drop it. Trying a genuinely different method after a failure is fine and often the right move; grinding the identical failing thing over and over without saying anything is not.
-- If the user clearly means to stop/cancel/abort something currently running (not just the word "stop" appearing somewhere in an unrelated sentence — judge real intent), call stop_background_jobs immediately and don't finish "just one more attempt" first. Confirm what actually happened based on the tool's real result, not an assumption.`;
+- If the user says to stop, cancel, or drop something mid-task, stop immediately — don't finish "just one more attempt" first.`;
 }
 
 async function buildMessages(session, userText, participantJid, participantName, quotaInfo = {}) {
@@ -212,6 +213,7 @@ async function callModel(messages, modelId, apiKey, baseUrl, toolsEnabled = true
  * expected — only a STREAK stops it).
  */
 const MAX_CONSECUTIVE_TOOL_FAILURES = 5;
+const STOP_WORD_PATTERN = /\b(stop|cancel|abort|never\s*mind|nevermind|forget it|that'?s enough|enough|ctrl\s*[+\-]?\s*c)\b/i;
 
 /**
  * Returns null if this session can make model calls right now, or a
@@ -235,16 +237,21 @@ function keyBlockReason(session, isAdmin) {
 export async function runYuki(session, userText, participantJid, participantName, toolCtx = {}, progress = async () => {}) {
   const isAdmin = isAdminSession(session);
 
-  // Stopping a running background job is now a TOOL CALL
-  // (stop_background_jobs in agentTools.js), not a code-level regex match
-  // on the message text. The earlier version matched the bare word
-  // "stop"/"cancel"/etc. ANYWHERE in the message and killed every
-  // background job unconditionally — "stop by the store later" or "don't
-  // stop until it works" both wrongly triggered a real kill. The model
-  // now judges actual intent from context (see that tool's description)
-  // before calling it; the kill mechanism itself (killBackgroundJobs) is
-  // unchanged and still a real SIGTERM/SIGKILL, just gated by judgment
-  // instead of substring match.
+  // CODE-LEVEL stop, checked BEFORE any model call — deliberately not
+  // something the model decides to honor. See killBackgroundJobs() in
+  // terminal.js for why this has to be a direct kill, not a text reply
+  // claiming something happened.
+  if (STOP_WORD_PATTERN.test(userText)) {
+    const { killed, alreadyDead } = killBackgroundJobs(session.id);
+    const reply = killed > 0
+      ? `Stopped. Killed ${killed} running background job${killed === 1 ? '' : 's'}.`
+      : alreadyDead > 0
+        ? 'Nothing was actually still running (any earlier background job had already ended) — but stopping here as asked.'
+        : "Stopped — there wasn't a background job to kill, but I won't run anything further for this message.";
+    sessionStore.recordMemory(session, 'assistant', reply);
+    await sessionStore.appendChat(session, { role: 'assistant', content: reply, at: new Date().toISOString() });
+    return reply;
+  }
 
   // No usable key at all -> can't call the model, period, chat or not.
   const blockReason = keyBlockReason(session, isAdmin);
