@@ -7,7 +7,7 @@
 # to trigger wake/sleep on in the first place).
 #
 # MUST be Node 22+ (not 20): src/storage/sessionStore.js imports the
-# built-in node:sqlite module, which does not exist at all in Node 20 —
+# built-in `node:sqlite` module, which does not exist at all in Node 20 —
 # it was only added in Node 22.5.0, and needs 22.13+ to run without the
 # --experimental-sqlite flag. Node 20 threw exactly this at boot:
 #   Error [ERR_UNKNOWN_BUILTIN_MODULE]: No such built-in module: node:sqlite
@@ -16,12 +16,23 @@
 # stopgap version bump.
 FROM node:22-slim
 
+# git, curl, wget — the model's run_command tool needs these to actually
+# clone/pull from GitHub and download files, which it was previously
+# unable to do (base node:22-slim has none of them). Kept to exactly
+# these three, as plain standard Debian repo packages — no custom repos,
+# no downloaded .deb files, no inline comments inside the RUN line's
+# backslash continuation. That last part matters: an earlier attempt at
+# this had per-package-group comments interleaved between \-continued
+# lines, which is fragile shell-form RUN syntax and is what actually
+# broke that build — comments now live here, above the RUN, not inside it.
+RUN apt-get update && apt-get install -y --no-install-recommends git curl wget && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 COPY package*.json ./
 # npm ci is faster and fully reproducible (exact versions from the
 # lockfile) but requires package-lock.json to exist. Falls back to
-# npm install if there's no lockfile in the repo yet. Either way, ls
+# npm install if there's no lockfile in the repo yet. Either way, `ls`
 # right after prints the resolved dependency tree into the Fly build
 # log so you can confirm packages actually landed, instead of finding
 # out at runtime via a missing-module crash.

@@ -41,6 +41,35 @@ function endpoint(base) {
   return base.endsWith('/chat/completions') ? base : `${base}/chat/completions`;
 }
 
+// Turns a tool call into a short, human line for the mid-task progress
+// update above — plain language, no function names or raw args leaked
+// (same rule as the system prompt: never reveal tool/function internals
+// to the user). Falls back to a generic phrase for any tool not listed
+// here rather than staying silent, since a new tool added later
+// shouldn't silently lose progress narration.
+function describeToolForProgress(call) {
+  let args = {};
+  try { args = JSON.parse(call.function.arguments || '{}'); } catch { /* leave args empty */ }
+  switch (call.function.name) {
+    case 'run_command': {
+      const cmd = Array.isArray(args.command) ? args.command.join(' && ') : String(args.command || '');
+      const first = cmd.trim().split(/\s+/)[0] || '';
+      if (/^git$/i.test(first)) return 'running git';
+      if (/^(npm|pnpm|yarn|pip3?)$/i.test(first)) return 'installing packages';
+      if (/^(node|python3?|tsx)$/i.test(first)) return 'running that';
+      return cmd ? `running: ${cmd.slice(0, 60)}${cmd.length > 60 ? '…' : ''}` : 'running a command';
+    }
+    case 'web_search': return `searching for "${String(args.query || '').slice(0, 50)}"`;
+    case 'receive_file': return 'downloading the file';
+    case 'send_file': return 'sending that back';
+    case 'analyze_image': return 'looking at the image';
+    case 'read_file': case 'list_files': case 'search_code': return 'checking the files';
+    case 'write_file': case 'edit_file': return 'writing that out';
+    case 'stop_background_jobs': return 'stopping that';
+    default: return 'working on it';
+  }
+}
+
 function identity(session, quotaInfo = {}) {
   const groupRules = session.type === 'group'
     ? `
@@ -95,6 +124,8 @@ How to think:
 - For anything with real stakes or complexity — debugging, multi-step tasks, decisions with tradeoffs, math, planning — reason through it carefully step by step before answering, and actually use run_command to check your work when you can (run the code, don't just guess what it does).
 - For simple stuff — a greeting, a joke, a quick fact — just answer. Don't overthink small talk.
 - NEVER report a tool call as successful if its actual result was an error. If list_files, delete_path, or any tool returns an error, say so plainly and either try a different real approach or tell the user it failed — don't guess at what the result probably would have been and present that guess as what happened.
+- The reverse also applies: never invent a dramatic-sounding reason for a failure when the tool result already tells you the real one. If run_command returns "command not found" for something like git, that means it genuinely isn't installed yet — say exactly that and install it (e.g. apt-get install -y git, or the right package manager for whatever's missing) via run_command yourself, then retry. Do NOT tell the user you're blocked by "sandbox restrictions", "security policy", or any other invented limitation that isn't what the tool actually returned — you have real, working shell access (run_command), file access, and the ability to install anything missing. If something is genuinely unavailable (no network reachable, a real permission error from the OS itself), report that exact error, not a guess dressed up as a policy.
+- Don't blanket-deny a capability you actually have. Before telling someone you can't do something, check: is there a tool for this (run_command, file tools, web_search, receive_file/send_file, analyze_image)? Could installing something make it possible? Only say no once you've actually tried and hit a real, reportable error — not as a first response to something that sounds hard.
 - If the same approach fails repeatedly (same error, same method, no real progress), don't just keep blindly retrying it — after a few tries, stop and tell the user what's failing and ask whether to try a different approach or drop it. Trying a genuinely different method after a failure is fine and often the right move; grinding the identical failing thing over and over without saying anything is not.
 - If the user clearly means to stop/cancel/abort something currently running (not just the word "stop" appearing somewhere in an unrelated sentence — judge real intent), call stop_background_jobs immediately and don't finish "just one more attempt" first. Confirm what actually happened based on the tool's real result, not an assumption.`;
 }
@@ -326,6 +357,26 @@ export async function runYuki(session, userText, participantJid, participantName
     }
 
     messages.push({ role: 'assistant', content: message.content || null, tool_calls: calls });
+
+    // Mid-task progress updates — the `progress` callback was already
+    // threaded all the way through (WhatsApp's caller in whatsapp.js
+    // wires it to a real sendMessage), but nothing in this loop ever
+    // actually called it, so the agent went completely silent for the
+    // full duration of any multi-round tool sequence (cloning a repo,
+    // running a build, chaining several commands) and only spoke again
+    // once everything finished. Starting from round 2 (not round 1 —
+    // a quick single-tool exchange finishing fast is normal and doesn't
+    // need narration) this sends a short plain-language line for what's
+    // about to run, using the tool calls themselves rather than asking
+    // the model to separately narrate — the actual call already says
+    // exactly what's happening, so this can't drift out of sync with
+    // what's really running.
+    if (round >= 1) {
+      const summary = calls.map(c => describeToolForProgress(c)).filter(Boolean).join(', ');
+      if (summary) {
+        try { await progress(summary); } catch { /* best-effort — a failed status update shouldn't break the actual task */ }
+      }
+    }
 
     let anySucceededThisRound = false;
     for (const call of calls) {

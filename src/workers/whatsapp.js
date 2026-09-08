@@ -357,7 +357,7 @@ async function handleIncomingMessage(msg) {
       participantJid,
       displayName,
       toolCtx,
-      async (status) => { await this.sendMessage(jid, { text: status }); },
+      async (status) => { await this.sendMessage(jid, { text: `⋯ ${status}` }); },
     ));
   } catch (error) {
     // Without this, a failed model call (bad YUKI_API_BASE_URL, unreachable

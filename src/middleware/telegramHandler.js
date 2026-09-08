@@ -217,7 +217,14 @@ async function handleChat(bot, msg, text) {
 
   let reply;
   try {
-    reply = await withTypingTelegram(bot, chatId, () => runYuki(session, effectiveText, jid, displayName, toolCtx));
+    reply = await withTypingTelegram(bot, chatId, () => runYuki(
+      session,
+      effectiveText,
+      jid,
+      displayName,
+      toolCtx,
+      async (status) => { await bot.sendMessage(chatId, `⋯ ${status}`); },
+    ));
   } catch (error) {
     console.error('[Yuki call failed - telegram]', error?.message || error);
     await bot.sendMessage(chatId, `⚠️ Couldn't get a reply from the model: ${error?.message || 'unknown error'}`);
