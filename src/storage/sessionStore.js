@@ -7,7 +7,27 @@ function safeName(value) {
   return String(value).trim().replace(/[^a-zA-Z0-9_-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 64);
 }
 
+// Per-session SQLite connections, cached by memory_db_path so a session's
+// database is opened and initialized (PRAGMA + CREATE TABLE + migration
+// check) exactly ONCE for the life of the process, not on every single
+// memory operation. Previously openMemory() was called fresh by every
+// individual method below (recordMemory, saveFact, getFacts, addTodo,
+// getTodos, updateTodo, deleteTodo, forgetFact, getMemory — 11 call
+// sites), each paying the full open+schema-check+close cost — for a
+// tool-heavy turn calling several of these in sequence, that overhead
+// was very likely the real source of noticeable slowness (this is a
+// classic connection-per-operation anti-pattern, not something the
+// model or the API call is responsible for). better-sqlite3-style
+// DatabaseSync connections are safe to hold open and reuse across calls
+// within one process — WAL mode is specifically designed for exactly
+// this (concurrent readers, a single writer, no lock contention issue
+// from keeping the handle open).
+const memoryConnections = new Map(); // memory_db_path -> DatabaseSync
+
 function openMemory(session) {
+  const cached = memoryConnections.get(session.memory_db_path);
+  if (cached) return cached;
+
   const db = new DatabaseSync(session.memory_db_path);
   db.exec('PRAGMA journal_mode = WAL;');
   db.exec(`CREATE TABLE IF NOT EXISTS memory (
@@ -33,11 +53,14 @@ function openMemory(session) {
   // table that already existed before this column was introduced — every
   // session database created before this change needs an explicit ALTER
   // TABLE, or forgetFact()/getFacts() below will throw "no such column"
-  // on any pre-existing session.
+  // on any pre-existing session. Only needs to run once per connection
+  // (now that connections are cached), not once per call.
   const existingColumns = db.prepare('PRAGMA table_info(memory_facts)').all().map(c => c.name);
   if (!existingColumns.includes('deleted_at')) {
     db.exec('ALTER TABLE memory_facts ADD COLUMN deleted_at TEXT;');
   }
+
+  memoryConnections.set(session.memory_db_path, db);
   return db;
 }
 
@@ -403,7 +426,6 @@ export class SessionStore {
       const memory = openMemory(session);
       const meta = memory.prepare('INSERT OR REPLACE INTO metadata (key,value) VALUES (?,?)');
       for (const [k, v] of [['session_id', String(session.id)], ['registered_name', registeredName], ['chat_jid', jid], ['chat_type', type]]) meta.run(k, v);
-      memory.close();
 
       await fs.writeFile(chatJsonPath, JSON.stringify({
         sessionId: session.id,
@@ -434,7 +456,6 @@ export class SessionStore {
     const memory = openMemory(session);
     memory.prepare('INSERT INTO memory (role,sender_jid,sender_name,content) VALUES (?,?,?,?)')
       .run(role, senderJid, senderName, String(content));
-    memory.close();
   }
 
   saveFact(session, key, value) {
@@ -443,14 +464,11 @@ export class SessionStore {
     // that was previously forgotten) revives it, since that's clearly the
     // user's intent when they ask to remember the same key again.
     memory.prepare('INSERT INTO memory_facts (key,value,updated_at,deleted_at) VALUES (?,?,CURRENT_TIMESTAMP,NULL) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP,deleted_at=NULL').run(String(key).trim(), String(value).trim());
-    memory.close();
   }
 
   getFacts(session) {
     const memory = openMemory(session);
-    const rows = memory.prepare('SELECT key,value FROM memory_facts WHERE deleted_at IS NULL ORDER BY updated_at DESC').all();
-    memory.close();
-    return rows;
+    return memory.prepare('SELECT key,value FROM memory_facts WHERE deleted_at IS NULL ORDER BY updated_at DESC').all();
   }
 
   /**
@@ -463,29 +481,22 @@ export class SessionStore {
   forgetFact(session, key) {
     const memory = openMemory(session);
     const result = memory.prepare('UPDATE memory_facts SET deleted_at = CURRENT_TIMESTAMP WHERE key = ? AND deleted_at IS NULL').run(String(key).trim());
-    memory.close();
     return result.changes > 0;
   }
 
   /** Searches facts by key/value substring, active facts only — the recall side of remember/forget. */
   recallFacts(session, query) {
     const memory = openMemory(session);
-    let rows;
     if (query && query.trim()) {
       const needle = `%${query.trim()}%`;
-      rows = memory.prepare('SELECT key,value FROM memory_facts WHERE deleted_at IS NULL AND (key LIKE ? OR value LIKE ?) ORDER BY updated_at DESC').all(needle, needle);
-    } else {
-      rows = memory.prepare('SELECT key,value FROM memory_facts WHERE deleted_at IS NULL ORDER BY updated_at DESC').all();
+      return memory.prepare('SELECT key,value FROM memory_facts WHERE deleted_at IS NULL AND (key LIKE ? OR value LIKE ?) ORDER BY updated_at DESC').all(needle, needle);
     }
-    memory.close();
-    return rows;
+    return memory.prepare('SELECT key,value FROM memory_facts WHERE deleted_at IS NULL ORDER BY updated_at DESC').all();
   }
 
   getMemory(session, limit = 30) {
     const memory = openMemory(session);
-    const rows = memory.prepare('SELECT role,sender_jid,sender_name,content,created_at FROM memory ORDER BY id DESC LIMIT ?').all(limit).reverse();
-    memory.close();
-    return rows;
+    return memory.prepare('SELECT role,sender_jid,sender_name,content,created_at FROM memory ORDER BY id DESC LIMIT ?').all(limit).reverse();
   }
 
   // --- Todo list -----------------------------------------------------
@@ -504,31 +515,26 @@ export class SessionStore {
     const { maxPos } = memory.prepare('SELECT COALESCE(MAX(position), -1) AS maxPos FROM todos').get();
     const position = maxPos + 1;
     const result = memory.prepare('INSERT INTO todos (text, status, position, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)').run(String(text).trim(), status, position);
-    const row = memory.prepare('SELECT id, text, status, position, created_at, updated_at FROM todos WHERE id = ?').get(result.lastInsertRowid);
-    memory.close();
-    return row;
+    return memory.prepare('SELECT id, text, status, position, created_at, updated_at FROM todos WHERE id = ?').get(result.lastInsertRowid);
   }
 
   /** Returns every todo, ordered by position — the full list as the agent (or a status report) should show it. */
   getTodos(session) {
     const memory = openMemory(session);
-    const rows = memory.prepare('SELECT id, text, status, position, created_at, updated_at FROM todos ORDER BY position ASC, id ASC').all();
-    memory.close();
-    return rows;
+    return memory.prepare('SELECT id, text, status, position, created_at, updated_at FROM todos ORDER BY position ASC, id ASC').all();
   }
 
   /** Updates a todo's status (and optionally its text) by id. Returns false if no todo exists with that id. */
   updateTodo(session, id, { status, text } = {}) {
     const memory = openMemory(session);
     const existing = memory.prepare('SELECT id FROM todos WHERE id = ?').get(id);
-    if (!existing) { memory.close(); return false; }
+    if (!existing) return false;
     if (status !== undefined) {
       memory.prepare('UPDATE todos SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(status, id);
     }
     if (text !== undefined) {
       memory.prepare('UPDATE todos SET text = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(String(text).trim(), id);
     }
-    memory.close();
     return true;
   }
 
@@ -536,7 +542,6 @@ export class SessionStore {
   deleteTodo(session, id) {
     const memory = openMemory(session);
     const result = memory.prepare('DELETE FROM todos WHERE id = ?').run(id);
-    memory.close();
     return result.changes > 0;
   }
 

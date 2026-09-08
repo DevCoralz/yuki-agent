@@ -82,6 +82,19 @@ function normalizeForStrictAlternation(messages) {
   return out;
 }
 
+// tools is a static array that never changes at runtime — pre-serializing
+// it once here avoids JSON.stringify re-walking the entire ~19KB schema
+// (every tool's name/description/parameters) on every single callModel()
+// invocation, which happens on every round of every tool loop. This is a
+// real, repeated cost: a 6-round debugging sequence was re-serializing
+// the same unchanged object graph 6 times. Spliced into the final request
+// body as a raw JSON fragment (see the manual string-concat below) rather
+// than going through JSON.stringify(body) as a whole, since `tools` is
+// the one part of body that's actually worth caching — messages and
+// reasoning_effort genuinely do change every call and still need real
+// per-call serialization.
+const TOOLS_JSON = JSON.stringify(tools);
+
 function endpoint(base) {
   return base.endsWith('/chat/completions') ? base : `${base}/chat/completions`;
 }
@@ -187,17 +200,10 @@ async function callModel(messages, modelId, apiKey, baseUrl, toolsEnabled = true
     ? normalizeForStrictAlternation(messages)
     : messages;
 
-  const body = {
+  const bodyWithoutTools = {
     model: modelId,
     messages: outgoing,
     temperature: 0.7,
-    // Omitted entirely (not sent as an empty array) when tools are
-    // locked out — most OpenAI-compatible servers treat an absent
-    // `tools` field as "no tools available" and just generate a normal
-    // chat reply, which is exactly what a quota-exceeded-but-still-
-    // chatting session needs: the model can't call anything, but text
-    // generation is unaffected.
-    ...(toolsEnabled ? { tools } : {}),
   };
   // Optional: only sent if configured, so providers that reject unknown
   // fields (anything not OpenAI-o-series-compatible) aren't broken by it.
@@ -210,7 +216,7 @@ async function callModel(messages, modelId, apiKey, baseUrl, toolsEnabled = true
   const validEffort = ['none', 'low', 'medium', 'high', 'max'];
   if (environment.yukiReasoningEffort) {
     if (validEffort.includes(environment.yukiReasoningEffort)) {
-      body.reasoning_effort = environment.yukiReasoningEffort;
+      bodyWithoutTools.reasoning_effort = environment.yukiReasoningEffort;
     } else {
       console.warn(
         `[Yuki] YUKI_REASONING_EFFORT="${environment.yukiReasoningEffort}" is not one of ${validEffort.join(', ')} — ignoring it for this call instead of sending an invalid value that would fail every request.`,
@@ -218,10 +224,23 @@ async function callModel(messages, modelId, apiKey, baseUrl, toolsEnabled = true
     }
   }
 
+  // Splice the pre-serialized tools schema in as a raw JSON fragment
+  // instead of including `tools` in bodyWithoutTools and letting
+  // JSON.stringify walk the whole thing again — see TOOLS_JSON's
+  // comment above for why. Omitted entirely (not sent as an empty
+  // array) when tools are locked out — most OpenAI-compatible servers
+  // treat an absent `tools` field as "no tools available" and just
+  // generate a normal chat reply, which is exactly what a
+  // quota-exceeded-but-still-chatting session needs: the model can't
+  // call anything, but text generation is unaffected.
+  const serializedBody = toolsEnabled
+    ? `${JSON.stringify(bodyWithoutTools).slice(0, -1)},"tools":${TOOLS_JSON}}`
+    : JSON.stringify(bodyWithoutTools);
+
   const response = await fetch(endpoint(baseUrl), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-    body: JSON.stringify(body),
+    body: serializedBody,
   });
   const raw = await response.text();
   let data;
