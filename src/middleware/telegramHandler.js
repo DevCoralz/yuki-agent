@@ -4,7 +4,7 @@ import { formatPairingCode, validatePhoneNumber } from '../utils/phone.js';
 import { buildMenuText, dispatchAdminCommand, cmdCtx, cmdMyKey, cmdMyEndpoint, cmdMyModel } from '../config/adminCommands.js';
 import { sessionStore } from '../storage/sessionStore.js';
 import { isAdminSession, getAccessMode, getCtxLimitChars } from '../config/adminConfig.js';
-import { runYuki } from '../ai/yuki.js';
+import { runYuki, isSessionBusy, queueMessageForBusySession } from '../ai/yuki.js';
 import { markdownToTelegram } from '../ai/telegramFormat.js';
 import { telegramMessageHasMedia } from '../tools/mediaTools.js';
 
@@ -212,6 +212,21 @@ async function handleChat(bot, msg, text) {
     senderName: displayName,
     at: new Date().toISOString(),
   });
+
+  // If this session already has a runYuki() call actively running (a
+  // multi-round tool task still in progress), do NOT start a second,
+  // competing call — that used to be the real bug behind messages sent
+  // mid-task silently getting no reply at all (two calls racing on the
+  // same session with no coordination between them). Queue this message
+  // into the running call's inbox instead — it gets injected as a real
+  // turn into the SAME conversation on the running call's next round
+  // (see the queue-drain at the top of runYuki's loop in yuki.js), so
+  // the model that's already working sees it and decides what to do,
+  // rather than the message vanishing or forking a second reply thread.
+  if (isSessionBusy(session.id)) {
+    queueMessageForBusySession(session.id, effectiveText);
+    return;
+  }
 
   const toolCtx = { bot, chatId, sourceMsg: hasMedia ? msg : null };
 

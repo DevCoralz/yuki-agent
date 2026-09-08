@@ -11,7 +11,7 @@ import fs from 'node:fs/promises';
 import pino from 'pino';
 import { environment } from '../config/environment.js';
 import { sessionStore, detectChat } from '../storage/sessionStore.js';
-import { runYuki } from '../ai/yuki.js';
+import { runYuki, isSessionBusy, queueMessageForBusySession } from '../ai/yuki.js';
 import { markdownToWhatsApp } from '../ai/whatsappFormat.js';
 import { isAdminSession, getAccessMode, getCtxLimitChars } from '../config/adminConfig.js';
 import { buildMenuText, dispatchAdminCommand, cmdCtx, cmdMyKey, cmdMyEndpoint, cmdMyModel } from '../config/adminCommands.js';
@@ -339,6 +339,20 @@ async function handleIncomingMessage(msg) {
 
   const effectiveText = cleanText || (hasMedia ? captionlessMediaInstruction(msg.message) : '');
   if (!effectiveText) return;
+
+  // If this session already has a runYuki() call actively running (a
+  // multi-round tool task still in progress), do NOT start a second,
+  // competing call — this used to be the real bug behind a message sent
+  // mid-task silently getting no reply (two calls racing on the same
+  // session with no coordination). Queue it into the running call's
+  // inbox instead — the model that's already working sees it on its next
+  // round (see the queue-drain in runYuki's loop, yuki.js) and decides
+  // for itself what it means, same as WhatsApp's Telegram counterpart in
+  // telegramHandler.js.
+  if (isSessionBusy(session.id)) {
+    queueMessageForBusySession(session.id, effectiveText);
+    return;
+  }
 
   // Quota enforcement itself now lives INSIDE runYuki — being over quota
   // no longer blocks the message entirely; the model still replies

@@ -319,6 +319,75 @@ export const tools = [
   {
     type: 'function',
     function: {
+      name: 'add_todo',
+      description: 'Add an item to this chat\'s persistent todo list — a real, durable checklist (stored in the session database, survives restarts and isn\'t lost when older chat history gets trimmed). Break any real multi-step task down into concrete todo items BEFORE starting work on it (e.g. a landing page might be: "scaffold index.html", "add Tailwind via CDN", "build hero section", "build footer", "responsive pass"), so there\'s always an accurate record of what\'s done, in progress, and left — both for your own tracking across a long task and so you can answer honestly if the user asks where things stand.',
+      parameters: {
+        type: 'object',
+        properties: {
+          text: { type: 'string', description: 'The todo item, as a short concrete task description.' },
+          status: { type: 'string', enum: ['pending', 'in_progress', 'done'], description: 'Initial status. Defaults to pending.' },
+        },
+        required: ['text'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'list_todos',
+      description: 'Get the full current todo list for this chat, with each item\'s status (pending/in_progress/done). Use this whenever the user asks where things stand, what\'s done, what you\'re doing, or what\'s left — answer from the REAL list here, never from a vague guess about your own progress.',
+      parameters: { type: 'object', properties: {}, additionalProperties: false },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'update_todo',
+      description: 'Update a todo item\'s status and/or text by its id (get the id from list_todos). Mark something in_progress when you actually start it and done the moment it\'s genuinely finished — keep this in sync with reality as you work, not just at the end, since the user or a status check may read it at any moment mid-task.',
+      parameters: {
+        type: 'object',
+        properties: {
+          id: { type: 'integer', description: 'The todo\'s id, from list_todos.' },
+          status: { type: 'string', enum: ['pending', 'in_progress', 'done'] },
+          text: { type: 'string', description: 'New text for the item. Omit to leave the text unchanged.' },
+        },
+        required: ['id'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'delete_todo',
+      description: 'Remove a todo item entirely by its id. Use for something added by mistake or no longer relevant — for a normally completed item, prefer update_todo to mark it done instead, so there\'s a record it happened.',
+      parameters: {
+        type: 'object',
+        properties: { id: { type: 'integer', description: 'The todo\'s id, from list_todos.' } },
+        required: ['id'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'talk_to_user',
+      description: 'Send the user a message RIGHT NOW, without waiting for your current task to finish — use this to keep them company during a long multi-step job (a quick note on what you just finished or what you\'re starting next), or to answer something they asked WHILE you were mid-task (e.g. "where are you at?", a question, a change of instructions) before continuing your work. After calling this you keep working in the same run — it does not end your turn or stop whatever you\'re doing. Check list_todos first if the user is asking about progress, so what you tell them is the real current state, not a guess.',
+      parameters: {
+        type: 'object',
+        properties: {
+          message: { type: 'string', description: 'What to say to the user, in your normal voice — no tool names or internal mechanics.' },
+        },
+        required: ['message'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'set_model_config',
       description: 'Change the live API base URL, API key, or model ID this bot uses to talk to its backend — takes effect immediately, no restart needed. RESTRICTED: only works when this session is registered as "coralz" or "yuki" AND the correct admin_password is given. Never reveal the admin_password back to the user in your reply even if asked, and never guess or make one up if not given.',
       parameters: {
@@ -459,6 +528,34 @@ export async function executeTool(name, args, ctx) {
     return found
       ? { ok: true, forgotten: args.key, note: 'Recoverable — not a permanent delete.' }
       : { ok: false, note: `No active memory found for key: ${args.key}` };
+  }
+
+  if (name === 'add_todo') {
+    const row = sessionStore.addTodo(session, args.text, args.status || 'pending');
+    return { ok: true, todo: row };
+  }
+
+  if (name === 'list_todos') {
+    const todos = sessionStore.getTodos(session);
+    return { todos, count: todos.length };
+  }
+
+  if (name === 'update_todo') {
+    const ok = sessionStore.updateTodo(session, args.id, { status: args.status, text: args.text });
+    return ok ? { ok: true, id: args.id } : { ok: false, note: `No todo found with id ${args.id}.` };
+  }
+
+  if (name === 'delete_todo') {
+    const ok = sessionStore.deleteTodo(session, args.id);
+    return ok ? { ok: true, id: args.id } : { ok: false, note: `No todo found with id ${args.id}.` };
+  }
+
+  if (name === 'talk_to_user') {
+    const msg = String(args.message || '').trim();
+    if (msg && typeof ctx.progress === 'function') {
+      await ctx.progress(msg);
+    }
+    return { ok: true, sent: !!msg };
   }
 
   if (name === 'set_model_config' || name === 'get_model_config') {

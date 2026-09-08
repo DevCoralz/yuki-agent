@@ -19,7 +19,15 @@ function openMemory(session) {
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
   );
   CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-  CREATE TABLE IF NOT EXISTS memory_facts (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, deleted_at TEXT);`);
+  CREATE TABLE IF NOT EXISTS memory_facts (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, deleted_at TEXT);
+  CREATE TABLE IF NOT EXISTS todos (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    text TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    position INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );`);
 
   // CREATE TABLE IF NOT EXISTS does not retroactively add columns to a
   // table that already existed before this column was introduced — every
@@ -478,6 +486,58 @@ export class SessionStore {
     const rows = memory.prepare('SELECT role,sender_jid,sender_name,content,created_at FROM memory ORDER BY id DESC LIMIT ?').all(limit).reverse();
     memory.close();
     return rows;
+  }
+
+  // --- Todo list -----------------------------------------------------
+  // Real persistent SQLite storage in the same per-session memory DB as
+  // memory_facts (not the chat_json_path/context-window history below,
+  // which is capped and only holds recent turns) — status/position
+  // survive restarts and aren't subject to context truncation the way
+  // anything living only in the conversation would be. status is one of
+  // 'pending' | 'in_progress' | 'done'; only one item should realistically
+  // be 'in_progress' at a time, but that's left to the caller's judgment
+  // (the model's), not enforced here as a DB constraint.
+
+  /** Adds a new todo item at the end of the list (or a specific position if given). Returns the created row. */
+  addTodo(session, text, status = 'pending') {
+    const memory = openMemory(session);
+    const { maxPos } = memory.prepare('SELECT COALESCE(MAX(position), -1) AS maxPos FROM todos').get();
+    const position = maxPos + 1;
+    const result = memory.prepare('INSERT INTO todos (text, status, position, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)').run(String(text).trim(), status, position);
+    const row = memory.prepare('SELECT id, text, status, position, created_at, updated_at FROM todos WHERE id = ?').get(result.lastInsertRowid);
+    memory.close();
+    return row;
+  }
+
+  /** Returns every todo, ordered by position — the full list as the agent (or a status report) should show it. */
+  getTodos(session) {
+    const memory = openMemory(session);
+    const rows = memory.prepare('SELECT id, text, status, position, created_at, updated_at FROM todos ORDER BY position ASC, id ASC').all();
+    memory.close();
+    return rows;
+  }
+
+  /** Updates a todo's status (and optionally its text) by id. Returns false if no todo exists with that id. */
+  updateTodo(session, id, { status, text } = {}) {
+    const memory = openMemory(session);
+    const existing = memory.prepare('SELECT id FROM todos WHERE id = ?').get(id);
+    if (!existing) { memory.close(); return false; }
+    if (status !== undefined) {
+      memory.prepare('UPDATE todos SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(status, id);
+    }
+    if (text !== undefined) {
+      memory.prepare('UPDATE todos SET text = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(String(text).trim(), id);
+    }
+    memory.close();
+    return true;
+  }
+
+  /** Removes a todo entirely by id (a real delete, unlike forgetFact's soft-delete — a finished/irrelevant checklist item has no reason to stick around). Returns false if it didn't exist. */
+  deleteTodo(session, id) {
+    const memory = openMemory(session);
+    const result = memory.prepare('DELETE FROM todos WHERE id = ?').run(id);
+    memory.close();
+    return result.changes > 0;
   }
 
   async appendChat(session, message) {

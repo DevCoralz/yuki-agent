@@ -5,6 +5,51 @@ import { sanitizeIdentityLeak } from './identityFilter.js';
 import { resolveApiKeyForSession, resolveApiBaseUrlForSession, resolveApiModelForSession } from './runtimeConfig.js';
 import { isAdminSession, getCtxLimitChars, getCtxResetHours } from '../config/adminConfig.js';
 
+// --- In-flight session tracking + mid-task message inbox -------------
+// Previously, handleChat (Telegram) and handleIncomingMessage (WhatsApp)
+// called runYuki() independently per incoming message with no locking at
+// all — sending a second message while the first was still mid-task (a
+// multi-round tool loop: scaffolding files, running builds, etc.) started
+// a SECOND, fully independent runYuki() call for the same session. Both
+// calls then raced: reading/writing the same chat history, calling the
+// model concurrently, and the actual real-world symptom was the second
+// message just... not getting a reply, because there was no defined
+// behavior for two calls stepping on each other.
+//
+// This map is a simple session-id -> { queue: [] } registry: while a
+// session's runYuki() call is active, any NEW message that arrives for
+// that same session is pushed into `queue` instead of starting another
+// competing call. At the top of every tool-loop round (see the `for`
+// loop in runYuki below), the already-running call drains this queue
+// and injects each message as a real `user` turn into the same
+// conversation the model is already looking at — so the model ACTUALLY
+// sees the new message as normal input on its very next round and
+// decides for itself what to do with it (keep working and reply via
+// talk_to_user, treat it as a reason to stop via stop_background_jobs,
+// answer a question, whatever fits — this is deliberately NOT a
+// keyword/regex trigger on the message text; seeing it and understanding
+// intent is entirely the model's job, same reasoning as
+// stop_background_jobs).
+const inFlightSessions = new Map(); // sessionId -> { queue: string[] }
+
+/** True if this session currently has a runYuki() call actively running. */
+export function isSessionBusy(sessionId) {
+  return inFlightSessions.has(sessionId);
+}
+
+/**
+ * Pushes a message into a busy session's inbox instead of starting a
+ * competing runYuki() call. Returns true if it was queued (session was
+ * actually busy), false if there was nothing to queue into (caller
+ * should fall back to a normal runYuki() call instead).
+ */
+export function queueMessageForBusySession(sessionId, text) {
+  const entry = inFlightSessions.get(sessionId);
+  if (!entry) return false;
+  entry.queue.push(text);
+  return true;
+}
+
 // Chat templates differ in what role sequences they accept. Qwen's template
 // tolerates multiple leading `system` messages and has native `tool` role
 // support. Gemma's template (and llama.cpp's Jinja alternation check) does
@@ -127,7 +172,10 @@ How to think:
 - The reverse also applies: never invent a dramatic-sounding reason for a failure when the tool result already tells you the real one. If run_command returns "command not found" for something like git, that means it genuinely isn't installed yet — say exactly that and install it (e.g. apt-get install -y git, or the right package manager for whatever's missing) via run_command yourself, then retry. Do NOT tell the user you're blocked by "sandbox restrictions", "security policy", or any other invented limitation that isn't what the tool actually returned — you have real, working shell access (run_command), file access, and the ability to install anything missing. If something is genuinely unavailable (no network reachable, a real permission error from the OS itself), report that exact error, not a guess dressed up as a policy.
 - Don't blanket-deny a capability you actually have. Before telling someone you can't do something, check: is there a tool for this (run_command, file tools, web_search, receive_file/send_file, analyze_image)? Could installing something make it possible? Only say no once you've actually tried and hit a real, reportable error — not as a first response to something that sounds hard.
 - If the same approach fails repeatedly (same error, same method, no real progress), don't just keep blindly retrying it — after a few tries, stop and tell the user what's failing and ask whether to try a different approach or drop it. Trying a genuinely different method after a failure is fine and often the right move; grinding the identical failing thing over and over without saying anything is not.
-- If the user clearly means to stop/cancel/abort something currently running (not just the word "stop" appearing somewhere in an unrelated sentence — judge real intent), call stop_background_jobs immediately and don't finish "just one more attempt" first. Confirm what actually happened based on the tool's real result, not an assumption.`;
+- If the user clearly means to stop/cancel/abort something currently running (not just the word "stop" appearing somewhere in an unrelated sentence — judge real intent), call stop_background_jobs immediately and don't finish "just one more attempt" first. Confirm what actually happened based on the tool's real result, not an assumption.
+- For any real multi-step task (scaffolding a project, a multi-file change, anything with several distinct pieces) — break it into concrete steps with add_todo BEFORE starting work, mark each in_progress when you actually start it and done the moment it's genuinely finished with update_todo. This is not optional bookkeeping — it's what makes the rest of this section possible: an accurate answer if the user asks where things stand, and a persistent record that survives even if the conversation history gets trimmed. Never claim something is done without actually having done it.
+- A message from the user can arrive WHILE you're still mid-task — it shows up as a normal new turn in the conversation, exactly like this one. There is no special marker and no keyword to look for; read it the same way you'd read anything else they say and decide what it actually means from context. It might be a question about progress (check list_todos and answer from the real list, then keep going), an unrelated comment (acknowledge briefly if it warrants it, keep going), a change of direction, or genuinely wanting you to stop what's running — you decide which, the same way you already decide this for stop_background_jobs. Use talk_to_user to respond to it without losing your place in the task, unless what they said really is a reason to stop.
+- Use talk_to_user during a long task even when nothing new came in from the user — a brief note when you finish a real step or start the next one keeps the user from wondering if you've gone silent. Don't overdo it (not every single tool call needs a narration), but multi-round work should never go completely quiet until the very end.`;
 }
 
 async function buildMessages(session, userText, participantJid, participantName, quotaInfo = {}) {
@@ -264,6 +312,21 @@ function keyBlockReason(session, isAdmin) {
 }
 
 export async function runYuki(session, userText, participantJid, participantName, toolCtx = {}, progress = async () => {}) {
+  // Registered BEFORE any work starts, unregistered in `finally` so this
+  // is true for the exact lifetime of the call regardless of which
+  // return path or thrown error ends it — see the header comment above
+  // on inFlightSessions for why this exists (fixes the real concurrency
+  // race that silently dropped a message sent mid-task).
+  const inboxEntry = { queue: [] };
+  inFlightSessions.set(session.id, inboxEntry);
+  try {
+    return await runYukiInner(session, userText, participantJid, participantName, toolCtx, progress, inboxEntry);
+  } finally {
+    inFlightSessions.delete(session.id);
+  }
+}
+
+async function runYukiInner(session, userText, participantJid, participantName, toolCtx, progress, inboxEntry) {
   const isAdmin = isAdminSession(session);
 
   // Stopping a running background job is now a TOOL CALL
@@ -323,6 +386,25 @@ export async function runYuki(session, userText, participantJid, participantName
   const toolsEnabled = !overQuota;
 
   for (let round = 0; round < environment.yukiMaxToolRounds; round++) {
+    // Drain any messages that arrived WHILE this task was already
+    // running (see inFlightSessions / queueMessageForBusySession above).
+    // Injected as real `user` turns into the SAME conversation the model
+    // is already working through — the model sees them on this round's
+    // callModel() exactly like any other message and decides for itself
+    // what they mean and what to do (keep going + talk_to_user, treat it
+    // as a reason to stop_background_jobs, answer a question, change
+    // direction — entirely its judgment, nothing here interprets the
+    // text). Logged to chat history the same as any user message, so
+    // there's a real record of when it actually arrived relative to the
+    // task, not just when the task happened to finish.
+    if (inboxEntry.queue.length) {
+      const pending = inboxEntry.queue.splice(0, inboxEntry.queue.length);
+      for (const queuedText of pending) {
+        messages.push({ role: 'user', content: `${participantName}: ${queuedText}` });
+        await sessionStore.appendChat(session, { role: 'user', content: queuedText, senderJid: participantJid, senderName: participantName, at: new Date().toISOString() });
+      }
+    }
+
     const message = await callModel(messages, apiModel, apiKey, apiBaseUrl, toolsEnabled);
     let calls = message?.tool_calls || [];
 
@@ -383,7 +465,7 @@ export async function runYuki(session, userText, participantJid, participantName
       let result;
       try {
         const args = JSON.parse(call.function.arguments || '{}');
-        result = await executeTool(call.function.name, args, { session, participantJid, participantName, ...toolCtx });
+        result = await executeTool(call.function.name, args, { session, participantJid, participantName, progress, ...toolCtx });
         if (!result?.error) anySucceededThisRound = true;
       } catch (e) {
         result = { error: e?.message || 'Tool execution failed.' };
