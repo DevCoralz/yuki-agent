@@ -86,35 +86,6 @@ function endpoint(base) {
   return base.endsWith('/chat/completions') ? base : `${base}/chat/completions`;
 }
 
-// Turns a tool call into a short, human line for the mid-task progress
-// update above — plain language, no function names or raw args leaked
-// (same rule as the system prompt: never reveal tool/function internals
-// to the user). Falls back to a generic phrase for any tool not listed
-// here rather than staying silent, since a new tool added later
-// shouldn't silently lose progress narration.
-function describeToolForProgress(call) {
-  let args = {};
-  try { args = JSON.parse(call.function.arguments || '{}'); } catch { /* leave args empty */ }
-  switch (call.function.name) {
-    case 'run_command': {
-      const cmd = Array.isArray(args.command) ? args.command.join(' && ') : String(args.command || '');
-      const first = cmd.trim().split(/\s+/)[0] || '';
-      if (/^git$/i.test(first)) return 'running git';
-      if (/^(npm|pnpm|yarn|pip3?)$/i.test(first)) return 'installing packages';
-      if (/^(node|python3?|tsx)$/i.test(first)) return 'running that';
-      return cmd ? `running: ${cmd.slice(0, 60)}${cmd.length > 60 ? '…' : ''}` : 'running a command';
-    }
-    case 'web_search': return `searching for "${String(args.query || '').slice(0, 50)}"`;
-    case 'receive_file': return 'downloading the file';
-    case 'send_file': return 'sending that back';
-    case 'analyze_image': return 'looking at the image';
-    case 'read_file': case 'list_files': case 'search_code': return 'checking the files';
-    case 'write_file': case 'edit_file': return 'writing that out';
-    case 'stop_background_jobs': return 'stopping that';
-    default: return 'working on it';
-  }
-}
-
 function identity(session, quotaInfo = {}) {
   const groupRules = session.type === 'group'
     ? `
@@ -175,7 +146,7 @@ How to think:
 - If the user clearly means to stop/cancel/abort something currently running (not just the word "stop" appearing somewhere in an unrelated sentence — judge real intent), call stop_background_jobs immediately and don't finish "just one more attempt" first. Confirm what actually happened based on the tool's real result, not an assumption.
 - For any real multi-step task (scaffolding a project, a multi-file change, anything with several distinct pieces) — break it into concrete steps with add_todo BEFORE starting work, mark each in_progress when you actually start it and done the moment it's genuinely finished with update_todo. This is not optional bookkeeping — it's what makes the rest of this section possible: an accurate answer if the user asks where things stand, and a persistent record that survives even if the conversation history gets trimmed. Never claim something is done without actually having done it.
 - A message from the user can arrive WHILE you're still mid-task — it shows up as a normal new turn in the conversation, exactly like this one. There is no special marker and no keyword to look for; read it the same way you'd read anything else they say and decide what it actually means from context. It might be a question about progress (check list_todos and answer from the real list, then keep going), an unrelated comment (acknowledge briefly if it warrants it, keep going), a change of direction, or genuinely wanting you to stop what's running — you decide which, the same way you already decide this for stop_background_jobs. Use talk_to_user to respond to it without losing your place in the task, unless what they said really is a reason to stop.
-- Use talk_to_user during a long task even when nothing new came in from the user — a brief note when you finish a real step or start the next one keeps the user from wondering if you've gone silent. Don't overdo it (not every single tool call needs a narration), but multi-round work should never go completely quiet until the very end.`;
+- Working in the background is normally SILENT — this is the default, not an exception. Running commands, retrying something that failed, checking files, debugging: none of that gets narrated. Don't call talk_to_user just because a round finished or a command ran; that produces exactly the wall-of-status-updates spam that must never happen, and it also leaks internal mechanics (raw commands, file paths, retry loops) that should never reach the user — same rule as never revealing tool names or function-call syntax. Only call talk_to_user when there's a real reason: the user actually asked something mid-task (answer from list_todos, then keep working), or something genuinely blocking happened that changes what you'll do next. A long task finishing its normal internal steps — even many of them, even several retries — is not by itself a reason to say anything until you're done.`;
 }
 
 async function buildMessages(session, userText, participantJid, participantName, quotaInfo = {}) {
@@ -439,26 +410,6 @@ async function runYukiInner(session, userText, participantJid, participantName, 
     }
 
     messages.push({ role: 'assistant', content: message.content || null, tool_calls: calls });
-
-    // Mid-task progress updates — the `progress` callback was already
-    // threaded all the way through (WhatsApp's caller in whatsapp.js
-    // wires it to a real sendMessage), but nothing in this loop ever
-    // actually called it, so the agent went completely silent for the
-    // full duration of any multi-round tool sequence (cloning a repo,
-    // running a build, chaining several commands) and only spoke again
-    // once everything finished. Starting from round 2 (not round 1 —
-    // a quick single-tool exchange finishing fast is normal and doesn't
-    // need narration) this sends a short plain-language line for what's
-    // about to run, using the tool calls themselves rather than asking
-    // the model to separately narrate — the actual call already says
-    // exactly what's happening, so this can't drift out of sync with
-    // what's really running.
-    if (round >= 1) {
-      const summary = calls.map(c => describeToolForProgress(c)).filter(Boolean).join(', ');
-      if (summary) {
-        try { await progress(summary); } catch { /* best-effort — a failed status update shouldn't break the actual task */ }
-      }
-    }
 
     let anySucceededThisRound = false;
     for (const call of calls) {

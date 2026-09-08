@@ -374,7 +374,7 @@ export const tools = [
     type: 'function',
     function: {
       name: 'talk_to_user',
-      description: 'Send the user a message RIGHT NOW, without waiting for your current task to finish — use this to keep them company during a long multi-step job (a quick note on what you just finished or what you\'re starting next), or to answer something they asked WHILE you were mid-task (e.g. "where are you at?", a question, a change of instructions) before continuing your work. After calling this you keep working in the same run — it does not end your turn or stop whatever you\'re doing. Check list_todos first if the user is asking about progress, so what you tell them is the real current state, not a guess.',
+      description: 'Send the user a message RIGHT NOW, without waiting for your current task to finish — use this ONLY when there\'s a real reason: the user asked you something WHILE you were mid-task (e.g. "where are you at?", a question, a change of instructions), or something genuinely significant happened that changes what you\'re doing. Do NOT use this for routine step-by-step narration ("now running X", "checking Y") — ordinary background work (commands, retries, checks) stays silent by default; calling this for every step produces spam and leaks internal mechanics that should stay hidden. After calling this you keep working in the same run — it does not end your turn or stop whatever you\'re doing. Check list_todos first if the user is asking about progress, so what you tell them is the real current state, not a guess.',
       parameters: {
         type: 'object',
         properties: {
