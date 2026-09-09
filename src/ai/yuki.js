@@ -140,6 +140,11 @@ Workspace: ${session.workspace_path}.
 Memory database: ${session.memory_db_path}.
 The workspace and memory belong only to this chat session.${groupRules}${quotaRules}
 
+You have three separate layers of memory — know which one to rely on:
+- Short memory: the tool calls and results you've made SO FAR in this current turn, while working on the current request. This is automatically kept in view for a limited recent window while you work, and older parts of it get folded into a brief "already tried" note once you've been working a while — that note is a real record of what you attempted, not you forgetting; don't repeat an approach it says already failed.
+- Session memory: the recent back-and-forth conversation with this user, automatically included on every message — you don't need a tool for this, it's just always there like normal chat history.
+- Long memory (remember/recall/forget tools): the ONLY layer that survives between separate messages beyond the recent conversation window, and the only one you control directly. If the user tells you something worth keeping — a preference, a decision, a fact about them or the project — actually call remember. Don't claim you'll "remember" something permanently unless you actually called that tool; session memory alone will not carry it forward once the conversation moves on. If asked whether you know something from before, call recall before saying no.
+
 How to talk:
 - Match the energy of whoever you're talking to. If they're joking around, joke back — be genuinely funny, quick, a little sharp, never stiff or robotic. If they're being serious or need real help, drop the jokes and focus.
 - Talk like a sharp, clever friend texting back, not like a customer support bot. Contractions, casual phrasing, no corporate hedging, no "I'd be happy to help you with that!" filler.
@@ -282,6 +287,128 @@ async function callModel(messages, modelId, apiKey, baseUrl, toolsEnabled = true
  */
 const MAX_CONSECUTIVE_TOOL_FAILURES = 5;
 
+// --- Short memory: cap the in-turn tool-call buffer -------------------
+// `messages` inside runYukiInner's tool loop is built ONCE by
+// buildMessages() (system prompt + session/JSON history + this turn's
+// user message) and then grows every round: one assistant tool_calls
+// entry plus one tool-result entry per call, per round, up to
+// yukiMaxToolRounds rounds. None of that ever went through
+// sessionStore.appendChat (by design — it's mid-task scratch, not
+// session history), but nothing ever trimmed the live array either, so
+// a long multi-round task resent the FULL accumulated tool transcript
+// on every single callModel() call within that turn. That's the actual
+// "short memory" tier: bounded per-turn tool activity, distinct from
+// session memory (capped JSON) and long memory (memory_facts sqlite).
+//
+// A "round" here is exactly one iteration of the runYukiInner tool loop:
+// one assistant tool_calls message + all of that round's tool-result
+// messages. We find round boundaries by scanning for
+// { role: 'assistant', tool_calls: [...] } markers, since that's the
+// only message type that starts a new round.
+function findRoundStartIndices(messages) {
+  const starts = [];
+  for (let i = 0; i < messages.length; i++) {
+    if (messages[i].role === 'assistant' && Array.isArray(messages[i].tool_calls)) {
+      starts.push(i);
+    }
+  }
+  return starts;
+}
+
+function charLength(messages) {
+  return messages.reduce((sum, m) => sum + (typeof m.content === 'string' ? m.content.length : JSON.stringify(m.content ?? '').length), 0);
+}
+
+/**
+ * Turns the messages of one dropped round into a single short line: what
+ * tool(s) were called and whether each succeeded or failed (with the
+ * error, truncated). This is deliberately compact — it exists so the
+ * model doesn't repeat a dead-end approach or lose track of what it
+ * already tried after that round's raw messages are gone, not to
+ * preserve full detail (that's what the raw recent rounds still in the
+ * window are for).
+ */
+function summarizeRound(roundMessages) {
+  const assistantMsg = roundMessages.find(m => m.role === 'assistant' && Array.isArray(m.tool_calls));
+  const calls = assistantMsg?.tool_calls || [];
+  const parts = calls.map(call => {
+    const toolMsg = roundMessages.find(m => m.role === 'tool' && m.tool_call_id === call.id);
+    let outcome = 'ok';
+    if (toolMsg) {
+      try {
+        const parsed = JSON.parse(toolMsg.content);
+        if (parsed?.error) outcome = `failed: ${String(parsed.error).slice(0, 80)}`;
+      } catch { /* non-JSON tool content, treat as ok */ }
+    }
+    return `${call.function?.name || 'tool'} (${outcome})`;
+  });
+  return parts.length ? `tried: ${parts.join(', ')}` : null;
+}
+
+/**
+ * Caps the in-turn messages array to at most yukiShortMemRounds of the
+ * most recent tool-call rounds, AND at most yukiShortMemMaxChars total —
+ * whichever limit is hit first. Everything before the first kept round
+ * (system prompt, session history, the current user turn's lead-in) is
+ * always preserved untouched. Rounds dropped from the front are folded
+ * into a single running summary line injected right after the
+ * preserved lead-in, so the model keeps a record of what it already
+ * tried even once the raw messages are gone.
+ *
+ * Mutates nothing — returns a new array. Called at the top of every
+ * loop iteration in runYukiInner, so it runs BEFORE callModel() sees
+ * the array, not after (trimming after the fact would mean the
+ * over-budget call already happened).
+ */
+const SHORT_MEM_SUMMARY_PREFIX = 'Earlier this turn (details trimmed to stay in budget) — ';
+
+function trimShortMemory(messages) {
+  const roundStarts = findRoundStartIndices(messages);
+  if (roundStarts.length <= environment.yukiShortMemRounds && charLength(messages) <= environment.yukiShortMemMaxChars) {
+    return messages; // nothing to trim yet
+  }
+
+  // How many of the most recent rounds we can keep under BOTH caps.
+  // Start from "keep by round count", then shrink further if that's
+  // still over the char budget.
+  let keepFromRound = Math.max(0, roundStarts.length - environment.yukiShortMemRounds);
+  while (keepFromRound < roundStarts.length) {
+    const candidateStart = roundStarts[keepFromRound];
+    const candidate = messages.slice(0, roundStarts[0]).concat(messages.slice(candidateStart));
+    if (charLength(candidate) <= environment.yukiShortMemMaxChars) break;
+    keepFromRound += 1;
+  }
+  if (keepFromRound >= roundStarts.length) keepFromRound = roundStarts.length - 1; // always keep at least the latest round
+
+  // The "lead" is everything before the first tool round: system prompt +
+  // session history + this turn's opening user message + (from a PRIOR
+  // call to this function) at most one existing running summary message.
+  // That existing summary is pulled out here — not left inside `lead` —
+  // so its lines get MERGED with this pass's newly-dropped rounds into a
+  // single line, rather than stacking a fresh summary message on every
+  // trim (which is what produced one line per round previously).
+  const rawLead = messages.slice(0, roundStarts[0]);
+  const existingSummaryIdx = rawLead.findIndex(m => m.role === 'system' && typeof m.content === 'string' && m.content.startsWith(SHORT_MEM_SUMMARY_PREFIX));
+  const priorSummaryText = existingSummaryIdx >= 0 ? rawLead[existingSummaryIdx].content.slice(SHORT_MEM_SUMMARY_PREFIX.length) : '';
+  const lead = existingSummaryIdx >= 0 ? rawLead.filter((_, i) => i !== existingSummaryIdx) : rawLead;
+
+  const droppedRoundRanges = [];
+  for (let r = 0; r < keepFromRound; r++) {
+    const start = roundStarts[r];
+    const end = roundStarts[r + 1] ?? messages.length;
+    droppedRoundRanges.push(messages.slice(start, end));
+  }
+  const kept = messages.slice(roundStarts[keepFromRound]);
+
+  const newLines = droppedRoundRanges.map(summarizeRound).filter(Boolean);
+  const allLines = priorSummaryText ? [priorSummaryText, ...newLines] : newLines;
+  const summaryMessage = allLines.length
+    ? [{ role: 'system', content: `${SHORT_MEM_SUMMARY_PREFIX}${allLines.join('; ')}` }]
+    : [];
+
+  return [...lead, ...summaryMessage, ...kept];
+}
+
 /**
  * Returns null if this session can make model calls right now, or a
  * plain-text explanation if it can't. Two independent things can block
@@ -369,7 +496,7 @@ async function runYukiInner(session, userText, participantJid, participantName, 
     resetAt = new Date(new Date(usage.windowStartedAt + 'Z').getTime() + resetHours * 60 * 60 * 1000);
   }
 
-  const messages = await buildMessages(session, userText, participantJid, participantName, { overQuota, resetAt, ctxLimit });
+  let messages = await buildMessages(session, userText, participantJid, participantName, { overQuota, resetAt, ctxLimit });
 
   let consecutiveFailures = 0;
   let lastFailureSummaries = [];
@@ -445,6 +572,12 @@ async function runYukiInner(session, userText, participantJid, participantName, 
       }
       messages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify(result) });
     }
+
+    // Short-memory cap: trim NOW, right after this round's messages are
+    // in, so the array handed to callModel() at the top of the NEXT
+    // round is already within budget — never resend an unbounded
+    // in-turn transcript. See trimShortMemory's header comment.
+    messages = trimShortMemory(messages);
 
     consecutiveFailures = anySucceededThisRound ? 0 : consecutiveFailures + 1;
 

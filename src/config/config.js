@@ -25,6 +25,31 @@ export const config = {
   yukiSystemPrompt: required('YUKI_SYSTEM_PROMPT'),
   yukiMaxToolRounds: Number.parseInt(process.env.YUKI_MAX_TOOL_ROUNDS || '12', 10),
   yukiHistoryMessages: Number.parseInt(process.env.YUKI_HISTORY_MESSAGES || '12', 10),
+  // --- Short-memory (in-turn tool-loop) window -------------------------
+  // The per-turn `messages` array in runYuki's tool loop (see yuki.js)
+  // used to grow unbounded across rounds — every tool_calls/tool message
+  // from every round of the CURRENT turn stayed in the array and got
+  // resent in full on every subsequent callModel() call, with nothing
+  // trimming it. On a multi-round debugging/scaffolding task (up to
+  // yukiMaxToolRounds rounds) this is what "sends everything at once to
+  // the API" actually was — not session (JSON) history, which was
+  // already capped, and not sqlite. These two knobs cap that in-turn
+  // buffer, whichever limit is hit first:
+  //   - yukiShortMemRounds: keep at most this many of the MOST RECENT
+  //     tool-call rounds' raw messages in-flight.
+  //   - yukiShortMemMaxChars: keep at most this many characters of
+  //     in-turn tool activity in-flight (chars/4 ≈ tokens, matching the
+  //     existing estimate used by the ctxLimit quota system in
+  //     adminConfig.js — kept consistent rather than inventing a second
+  //     token-estimation convention).
+  // Whichever bound is hit first starts trimming from the OLDEST rounds
+  // of THIS turn forward (the current user message and system prompt are
+  // never trimmed). Trimmed rounds are never just dropped — see
+  // summarizeDroppedRounds() in yuki.js, which folds them into a short
+  // running "already tried" note so the model doesn't lose track of
+  // what it already attempted mid-task.
+  yukiShortMemRounds: Number.parseInt(process.env.YUKI_SHORT_MEM_ROUNDS || '4', 10),
+  yukiShortMemMaxChars: Number.parseInt(process.env.YUKI_SHORT_MEM_MAX_CHARS || '32000', 10),
   // Optional. e.g. 'low' | 'medium' | 'high' — only sent to the model if set,
   // and only understood by reasoning-effort-compatible endpoints.
   yukiReasoningEffort: process.env.YUKI_REASONING_EFFORT || '',

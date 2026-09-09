@@ -15,7 +15,7 @@
 # 22-slim is current Node LTS (maintained into 2027), so this isn't a
 # stopgap version bump.
 FROM node:22-slim
-#
+
 # git, curl, wget — the model's run_command tool needs these to actually
 # clone/pull from GitHub and download files, which it was previously
 # unable to do (base node:22-slim has none of them). Kept to exactly
