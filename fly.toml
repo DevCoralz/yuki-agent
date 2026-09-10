@@ -25,7 +25,7 @@
 #   fly deploy
 #   fly machine update --restart always <machine-id>   (see note above)
 
-app = "yuki-agent-bot"   # change to whatever you actually name the Fly app
+app = "yuki-agent"
 primary_region = "iad"   # must match the volume's region
 
 [build]
@@ -59,15 +59,10 @@ primary_region = "iad"   # must match the volume's region
   # both apps are Fly apps in the same org.
   YUKI_API_BASE_URL = "http://yuki-model-server.internal:8000"
 
-[[mounts]]
-  # A single volume, mounted once at /data — both SESSION_DATA_PATH and
-  # YUKI_WORKSPACE_ROOT above are subdirectories of this same mount, so
-  # one volume covers both without needing two separate mounts. Losing
-  # this on redeploy means every WhatsApp session has to re-pair from a
-  # QR code again, and all remembered facts/chat history are gone — this
-  # MUST be persistent, not the container's own ephemeral filesystem.
-  source = "session_data"
-  destination = "/data"
+# No [[mounts]] block — /data is the container's own ephemeral disk.
+# SESSION_DATA_PATH and YUKI_WORKSPACE_ROOT below still point at /data,
+# but nothing is persisted: every restart/redeploy wipes WhatsApp auth
+# (re-pair from QR) and all session/memory data. Deliberate per request.
 
 [processes]
   app = "node src/app.js"
